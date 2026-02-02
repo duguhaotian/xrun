@@ -23,7 +23,7 @@ func NewClient(address, namespace, snapshotter string) (*Client, error) {
 		address = "/run/containerd/containerd.sock"
 	}
 	if namespace == "" {
-		namespace = "microvm-sandbox"
+		namespace = "default"
 	}
 	if snapshotter == "" {
 		snapshotter = "overlayfs"

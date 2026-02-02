@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,6 +12,20 @@ import (
 	"github.com/microvm/sandbox/pkg/vmm"
 	"github.com/microvm/sandbox/pkg/vmm/cloudhypervisor"
 )
+
+// CreateFlags holds the flags for the create command.
+type CreateFlags struct {
+	ID         string
+	Image      string
+	RootFS     string
+	VCPUs      uint
+	Memory     uint
+	MemBackend string
+	MemFile    string
+	Cmdline    string
+	VMM        string
+	AutoStart  bool
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -43,7 +58,7 @@ func run() error {
 		DataDir:             "/var/lib/sandbox",
 		DefaultVMM:          "cloud-hypervisor",
 		ContainerdAddress:   "/run/containerd/containerd.sock",
-		ContainerdNamespace: "microvm-sandbox",
+		ContainerdNamespace: "default",
 		Snapshotter:         "overlayfs",
 	}, factory)
 	if err != nil {
@@ -57,27 +72,26 @@ func run() error {
 	}
 
 	cmd := os.Args[1]
-	args := os.Args[2:]
 
 	switch cmd {
 	case "create":
-		return handleCreate(ctx, manager, args)
+		return handleCreate(ctx, manager, os.Args[2:])
 	case "start":
-		return handleStart(ctx, manager, args)
+		return handleStart(ctx, manager, os.Args[2:])
 	case "stop":
-		return handleStop(ctx, manager, args)
+		return handleStop(ctx, manager, os.Args[2:])
 	case "list":
-		return handleList(ctx, manager, args)
+		return handleList(ctx, manager, os.Args[2:])
 	case "snapshot":
-		return handleSnapshot(ctx, manager, args)
+		return handleSnapshot(ctx, manager, os.Args[2:])
 	case "restore":
-		return handleRestore(ctx, manager, args)
+		return handleRestore(ctx, manager, os.Args[2:])
 	case "pause":
-		return handlePause(ctx, manager, args)
+		return handlePause(ctx, manager, os.Args[2:])
 	case "resume":
-		return handleResume(ctx, manager, args)
+		return handleResume(ctx, manager, os.Args[2:])
 	case "delete":
-		return handleDelete(ctx, manager, args)
+		return handleDelete(ctx, manager, os.Args[2:])
 	case "help", "--help", "-h":
 		return printUsage()
 	default:
@@ -104,160 +118,105 @@ Commands:
   help       Show this help message
 
 Create Options:
-  --id            Sandbox identifier (required)
-  --image         OCI image reference containing kernel and initrd (required)
-  --rootfs        Path to root filesystem disk image (optional, passed as virtio disk)
-  --vcpus         Number of vCPUs (default: 1)
-  --memory        Memory size in MB (default: 512)
-  --mem-backend   Memory backend type: anonymous, file (default: anonymous)
-  --mem-file      Path to memory backend file (when mem-backend=file)
-  --cmdline       Kernel command line (default: "console=hvc0 root=/dev/vda1 rw")
-  --vmm           VMM driver to use (default: cloud-hypervisor)
-  --start         Auto-start the VM after creation
+  -id            Sandbox identifier (required)
+  -image         OCI image reference containing kernel and initrd (required)
+  -rootfs        Path to root filesystem disk image (optional)
+  -vcpus         Number of vCPUs (default: 1)
+  -memory        Memory size in MB (default: 512)
+  -mem-backend   Memory backend type: anonymous, file (default: anonymous)
+  -mem-file      Path to memory backend file (when mem-backend=file)
+  -cmdline       Kernel command line (default: "console=hvc0 root=/dev/vda1 rw")
+  -vmm           VMM driver to use (default: cloud-hypervisor)
+  -start         Auto-start the VM after creation
 
 Examples:
-  # Create sandbox from OCI image (kernel and initrd extracted from image)
-  xrun create --id myvm --image docker.io/myrepo/vm-image:v1.0 --rootfs /path/to/rootfs.img --vcpus 2 --memory 1024
+  # Create sandbox from OCI image
+  xrun create -id myvm -image docker.io/myrepo/vm-image:v1.0 -rootfs /path/to/rootfs.img -vcpus 2 -memory 1024
 
   # With custom cmdline
-  xrun create --id myvm --image docker.io/myrepo/vm-image:v1.0 --rootfs /path/to/rootfs.img --cmdline "console=ttyS0 root=/dev/vda1 rw quiet"
+  xrun create -id myvm -image docker.io/myrepo/vm-image:v1.0 -cmdline "console=ttyS0 root=/dev/vda1 rw quiet"
 
-  xrun start --id myvm
-  xrun stop --id myvm
+  xrun start -id myvm
+  xrun stop -id myvm
   xrun list
-  xrun snapshot --id myvm --dest /path/to/snapshot
-  xrun restore --id myvm --source /path/to/snapshot`)
+  xrun snapshot -id myvm -dest /path/to/snapshot
+  xrun restore -id myvm -source /path/to/snapshot`)
 	return nil
 }
 
 func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	var opts sandbox.CreateOptions
-	var id string
-	var memSizeMB uint32
-	var memBackend string
-	var memBackendPath string
-	var kernelImage string
-	var rootfsPath string
-	var cmdline string
+	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 
-	// Simple flag parsing
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--id":
-			i++
-			if i < len(args) {
-				id = args[i]
-			}
-		case "--image":
-			i++
-			if i < len(args) {
-				kernelImage = args[i]
-			}
-		case "--rootfs":
-			i++
-			if i < len(args) {
-				rootfsPath = args[i]
-			}
-		case "--cmdline":
-			i++
-			if i < len(args) {
-				cmdline = args[i]
-			}
-		case "--vcpus":
-			i++
-			if i < len(args) {
-				// Parse uint32
-				fmt.Sscanf(args[i], "%d", &opts.VCPUs)
-			}
-		case "--memory":
-			i++
-			if i < len(args) {
-				// Parse uint32
-				fmt.Sscanf(args[i], "%d", &memSizeMB)
-			}
-		case "--mem-backend":
-			i++
-			if i < len(args) {
-				memBackend = args[i]
-			}
-		case "--mem-file":
-			i++
-			if i < len(args) {
-				memBackendPath = args[i]
-			}
-		case "--vmm":
-			i++
-			if i < len(args) {
-				opts.VMM = args[i]
-			}
-		case "--start":
-			opts.AutoStart = true
-		}
+	var flags CreateFlags
+	fs.StringVar(&flags.ID, "id", "", "Sandbox identifier (required)")
+	fs.StringVar(&flags.Image, "image", "", "OCI image reference containing kernel and initrd (required)")
+	fs.StringVar(&flags.RootFS, "rootfs", "", "Path to root filesystem disk image (optional)")
+	fs.UintVar(&flags.VCPUs, "vcpus", 1, "Number of vCPUs")
+	fs.UintVar(&flags.Memory, "memory", 512, "Memory size in MB")
+	fs.StringVar(&flags.MemBackend, "mem-backend", "anonymous", "Memory backend type: anonymous, file")
+	fs.StringVar(&flags.MemFile, "mem-file", "", "Path to memory backend file (when mem-backend=file)")
+	fs.StringVar(&flags.Cmdline, "cmdline", "console=hvc0 root=/dev/vda1 rw", "Kernel command line")
+	fs.StringVar(&flags.VMM, "vmm", "cloud-hypervisor", "VMM driver to use")
+	fs.BoolVar(&flags.AutoStart, "start", false, "Auto-start the VM after creation")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 
-	if id == "" {
-		return fmt.Errorf("--id is required")
+	// Validate required flags
+	if flags.ID == "" {
+		return fmt.Errorf("-id is required")
 	}
-	if kernelImage == "" {
-		return fmt.Errorf("--image is required")
-	}
-
-	// Default values
-	if opts.VCPUs == 0 {
-		opts.VCPUs = 1
-	}
-	if memSizeMB == 0 {
-		memSizeMB = 512
-	}
-	if cmdline == "" {
-		cmdline = "console=hvc0 root=/dev/vda1 rw"
+	if flags.Image == "" {
+		return fmt.Errorf("-image is required")
 	}
 
-	// Set image
-	opts.Image = kernelImage
+	// Build options
+	opts := sandbox.CreateOptions{
+		VMM:       flags.VMM,
+		VCPUs:     uint32(flags.VCPUs),
+		AutoStart: flags.AutoStart,
+		Image:     flags.Image,
+		Memory: vmm.MemoryConfig{
+			SizeMB:      uint32(flags.Memory),
+			Backend:     vmm.MemoryBackendType(flags.MemBackend),
+			BackendPath: flags.MemFile,
+		},
+		Boot: vmm.BootConfig{
+			Cmdline: flags.Cmdline,
+		},
+	}
 
-	// Build rootfs as virtio disk (if provided)
-	if rootfsPath != "" {
+	// Build rootfs disk config if provided
+	if flags.RootFS != "" {
 		opts.RootFS = vmm.DiskConfig{
-			Path:     rootfsPath,
+			Path:     flags.RootFS,
 			ReadOnly: false,
 			Format:   "raw",
 		}
 	}
 
-	// Build memory configuration
-	opts.Memory.SizeMB = memSizeMB
-	opts.Memory.Backend = vmm.MemoryBackendAnonymous // default
-	if memBackend == "file" {
-		opts.Memory.Backend = vmm.MemoryBackendFile
-		opts.Memory.BackendPath = memBackendPath
-	}
-
-	// Set kernel command line
-	opts.Boot = vmm.BootConfig{
-		Cmdline: cmdline,
-	}
-
-	vm, err := manager.Create(ctx, id, opts)
+	vm, err := manager.Create(ctx, flags.ID, opts)
 	if err != nil {
 		return err
 	}
 
 	info, _ := vm.Info(ctx)
-	fmt.Printf("Created sandbox %s (State: %s)\n", id, info.State)
+	fmt.Printf("Created sandbox %s (State: %s)\n", flags.ID, info.State)
 	return nil
 }
 
 func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	var id string
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--id" && i+1 < len(args) {
-			id = args[i+1]
-			i++
-		}
+	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+
 	if id == "" {
-		return fmt.Errorf("--id is required")
+		return fmt.Errorf("-id is required")
 	}
 
 	vm, err := manager.Get(id)
@@ -274,21 +233,18 @@ func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) e
 }
 
 func handleStop(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
 	var id string
 	var force bool
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--id":
-			i++
-			if i < len(args) {
-				id = args[i]
-			}
-		case "--force":
-			force = true
-		}
+	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
+	fs.BoolVar(&force, "force", false, "Force stop")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+
 	if id == "" {
-		return fmt.Errorf("--id is required")
+		return fmt.Errorf("-id is required")
 	}
 
 	if err := manager.Stop(ctx, id, force); err != nil {
@@ -320,26 +276,19 @@ func handleList(ctx context.Context, manager *sandbox.Manager, args []string) er
 }
 
 func handleSnapshot(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
 	var id, dest string
 	var compress bool
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--id":
-			i++
-			if i < len(args) {
-				id = args[i]
-			}
-		case "--dest":
-			i++
-			if i < len(args) {
-				dest = args[i]
-			}
-		case "--compress":
-			compress = true
-		}
+	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
+	fs.StringVar(&dest, "dest", "", "Snapshot destination path (required)")
+	fs.BoolVar(&compress, "compress", false, "Compress snapshot")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+
 	if id == "" || dest == "" {
-		return fmt.Errorf("--id and --dest are required")
+		return fmt.Errorf("-id and -dest are required")
 	}
 
 	opts := sandbox.SnapshotOptions{
@@ -356,23 +305,17 @@ func handleSnapshot(ctx context.Context, manager *sandbox.Manager, args []string
 }
 
 func handleRestore(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
 	var id, source string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--id":
-			i++
-			if i < len(args) {
-				id = args[i]
-			}
-		case "--source":
-			i++
-			if i < len(args) {
-				source = args[i]
-			}
-		}
+	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
+	fs.StringVar(&source, "source", "", "Snapshot source path (required)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+
 	if id == "" || source == "" {
-		return fmt.Errorf("--id and --source are required")
+		return fmt.Errorf("-id and -source are required")
 	}
 
 	opts := sandbox.RestoreOptions{
@@ -388,15 +331,16 @@ func handleRestore(ctx context.Context, manager *sandbox.Manager, args []string)
 }
 
 func handlePause(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	fs := flag.NewFlagSet("pause", flag.ContinueOnError)
 	var id string
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--id" && i+1 < len(args) {
-			id = args[i+1]
-			i++
-		}
+	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+
 	if id == "" {
-		return fmt.Errorf("--id is required")
+		return fmt.Errorf("-id is required")
 	}
 
 	if err := manager.Pause(ctx, id); err != nil {
@@ -408,15 +352,16 @@ func handlePause(ctx context.Context, manager *sandbox.Manager, args []string) e
 }
 
 func handleResume(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
 	var id string
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--id" && i+1 < len(args) {
-			id = args[i+1]
-			i++
-		}
+	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+
 	if id == "" {
-		return fmt.Errorf("--id is required")
+		return fmt.Errorf("-id is required")
 	}
 
 	if err := manager.Resume(ctx, id); err != nil {
@@ -428,21 +373,18 @@ func handleResume(ctx context.Context, manager *sandbox.Manager, args []string) 
 }
 
 func handleDelete(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
 	var id string
 	var force bool
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--id":
-			i++
-			if i < len(args) {
-				id = args[i]
-			}
-		case "--force":
-			force = true
-		}
+	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
+	fs.BoolVar(&force, "force", false, "Force delete")
+
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+
 	if id == "" {
-		return fmt.Errorf("--id is required")
+		return fmt.Errorf("-id is required")
 	}
 
 	if err := manager.Delete(ctx, id, force); err != nil {
