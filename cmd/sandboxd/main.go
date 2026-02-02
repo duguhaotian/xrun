@@ -39,10 +39,14 @@ func run() error {
 	factory.Register("cloud-hypervisor", chDriver)
 
 	// Setup sandbox manager
-	manager := sandbox.NewManager(sandbox.Config{
+	manager, err := sandbox.NewManager(sandbox.Config{
 		DataDir:    "/var/lib/sandbox",
 		DefaultVMM: "cloud-hypervisor",
 	}, factory)
+	if err != nil {
+		return fmt.Errorf("failed to create sandbox manager: %w", err)
+	}
+	defer manager.Close()
 
 	// Parse command
 	if len(os.Args) < 2 {

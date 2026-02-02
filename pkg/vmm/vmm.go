@@ -27,9 +27,11 @@ type MemoryConfig struct {
 // BootConfig defines the boot configuration for the VM.
 // The VM boots using kernel + initrd, with rootfs mounted as virtio disk.
 type BootConfig struct {
-	KernelPath string // Path to kernel image (vmlinux or bzImage)
-	InitrdPath string // Path to initrd/initramfs image
-	Cmdline    string // Kernel command line, should include root=/dev/vda1 or similar
+	KernelPath  string // Path to kernel image (vmlinux or bzImage)
+	InitrdPath  string // Path to initrd/initramfs image
+	Cmdline     string // Kernel command line, should include root=/dev/vda1 or similar
+	SnapshotKey string // Snapshot key for kernel image (internal use)
+	MountPath   string // Mount path for kernel snapshot (internal use)
 }
 
 // VMConfig contains configuration for creating a new microVM.

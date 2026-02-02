@@ -7,42 +7,71 @@ import (
 	"sync"
 	"time"
 
+	"github.com/microvm/sandbox/pkg/image"
 	"github.com/microvm/sandbox/pkg/vmm"
 )
 
 // Manager handles the lifecycle of multiple sandboxes.
 type Manager struct {
-	factory   *vmm.Factory
-	sandboxes map[string]vmm.VM
-	dataDir   string
-	mu        sync.RWMutex
+	factory     *vmm.Factory
+	sandboxes   map[string]vmm.VM
+	dataDir     string
+	imageClient *image.Client
+	mu          sync.RWMutex
 }
 
 // Config contains manager configuration.
 type Config struct {
-	DataDir    string
-	DefaultVMM string
+	DataDir             string
+	DefaultVMM          string
+	ContainerdAddress   string
+	ContainerdNamespace string
+	Snapshotter         string
 }
 
 // NewManager creates a new sandbox manager.
-func NewManager(config Config, factory *vmm.Factory) *Manager {
-	return &Manager{
-		factory:   factory,
-		sandboxes: make(map[string]vmm.VM),
-		dataDir:   config.DataDir,
+func NewManager(config Config, factory *vmm.Factory) (*Manager, error) {
+	// Initialize image client if containerd address is provided
+	var imageClient *image.Client
+	if config.ContainerdAddress != "" {
+		client, err := image.NewClient(
+			config.ContainerdAddress,
+			config.ContainerdNamespace,
+			config.Snapshotter,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create image client: %w", err)
+		}
+		imageClient = client
 	}
+
+	return &Manager{
+		factory:     factory,
+		sandboxes:   make(map[string]vmm.VM),
+		dataDir:     config.DataDir,
+		imageClient: imageClient,
+	}, nil
+}
+
+// Close closes the manager and releases resources.
+func (m *Manager) Close() error {
+	if m.imageClient != nil {
+		return m.imageClient.Close()
+	}
+	return nil
 }
 
 // CreateOptions contains options for creating a sandbox.
 type CreateOptions struct {
-	VMM       string // VMM driver to use (default: cloud-hypervisor)
-	VCPUs     uint32
-	Memory    vmm.MemoryConfig // Memory configuration with backend
-	Boot      vmm.BootConfig   // Boot configuration (kernel + initrd)
-	RootFS    vmm.DiskConfig   // Root filesystem passed as virtio disk
-	Network   vmm.NetworkConfig
-	Disks     []vmm.DiskConfig // Additional disks
-	AutoStart bool
+	VMM         string // VMM driver to use (default: cloud-hypervisor)
+	VCPUs       uint32
+	Memory      vmm.MemoryConfig // Memory configuration with backend
+	Boot        vmm.BootConfig   // Boot configuration (kernel + initrd)
+	RootFS      vmm.DiskConfig   // Root filesystem passed as virtio disk
+	Network     vmm.NetworkConfig
+	Disks       []vmm.DiskConfig // Additional disks
+	AutoStart   bool
+	KernelImage string // OCI image reference for kernel (optional)
 }
 
 // Create creates a new sandbox with the given options.
@@ -65,11 +94,31 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 		return nil, fmt.Errorf("VMM driver %s not found", vmmName)
 	}
 
+	// Resolve kernel image if specified
+	bootConfig := opts.Boot
+	if opts.KernelImage != "" {
+		if m.imageClient == nil {
+			return nil, fmt.Errorf("image client not initialized, cannot use kernel image")
+		}
+
+		resolver := image.NewKernelResolver(m.imageClient)
+		bundle, err := resolver.Resolve(ctx, opts.KernelImage)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve kernel image %s: %w", opts.KernelImage, err)
+		}
+
+		// Update boot config with resolved paths
+		bootConfig.KernelPath = bundle.KernelPath
+		bootConfig.InitrdPath = bundle.InitrdPath
+		bootConfig.SnapshotKey = bundle.SnapshotKey
+		bootConfig.MountPath = bundle.MountPath
+	}
+
 	vmConfig := vmm.VMConfig{
 		ID:      id,
 		VCPUs:   opts.VCPUs,
 		Memory:  opts.Memory,
-		Boot:    opts.Boot,
+		Boot:    bootConfig,
 		RootFS:  opts.RootFS,
 		Network: opts.Network,
 		Disks:   opts.Disks,
@@ -77,6 +126,14 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 
 	vm, err := driver.Create(ctx, vmConfig)
 	if err != nil {
+		// Cleanup kernel snapshot if created
+		if bootConfig.SnapshotKey != "" && m.imageClient != nil {
+			bundle := &image.KernelBundle{
+				SnapshotKey: bootConfig.SnapshotKey,
+				MountPath:   bootConfig.MountPath,
+			}
+			_ = bundle.Release(ctx, m.imageClient.Snapshotter())
+		}
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
@@ -88,6 +145,14 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 			// Cleanup on start failure
 			_ = vm.ForceStop(ctx)
 			delete(m.sandboxes, id)
+			// Cleanup kernel snapshot
+			if bootConfig.SnapshotKey != "" && m.imageClient != nil {
+				bundle := &image.KernelBundle{
+					SnapshotKey: bootConfig.SnapshotKey,
+					MountPath:   bootConfig.MountPath,
+				}
+				_ = bundle.Release(ctx, m.imageClient.Snapshotter())
+			}
 			return nil, fmt.Errorf("failed to start VM: %w", err)
 		}
 	}
@@ -219,6 +284,8 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 			return fmt.Errorf("sandbox is running, stop it first or use force")
 		}
 	}
+
+	// TODO: Cleanup kernel snapshot if VM was created with kernel image
 
 	delete(m.sandboxes, id)
 	return nil
