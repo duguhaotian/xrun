@@ -40,8 +40,11 @@ func run() error {
 
 	// Setup sandbox manager
 	manager, err := sandbox.NewManager(sandbox.Config{
-		DataDir:    "/var/lib/sandbox",
-		DefaultVMM: "cloud-hypervisor",
+		DataDir:             "/var/lib/sandbox",
+		DefaultVMM:          "cloud-hypervisor",
+		ContainerdAddress:   "/run/containerd/containerd.sock",
+		ContainerdNamespace: "microvm-sandbox",
+		Snapshotter:         "overlayfs",
 	}, factory)
 	if err != nil {
 		return fmt.Errorf("failed to create sandbox manager: %w", err)
