@@ -16,6 +16,7 @@ type Manager struct {
 	factory       *vmm.Factory
 	sandboxes     map[string]vmm.VM
 	rootFSManager *image.RootFSManager
+	store         *Store
 	dataDir       string
 	mu            sync.RWMutex
 }
@@ -45,10 +46,14 @@ func NewManager(config Config, factory *vmm.Factory) (*Manager, error) {
 		rootFSManager = image.NewRootFSManager(client, config.DataDir)
 	}
 
+	// Initialize metadata store
+	store := NewStore(config.DataDir)
+
 	return &Manager{
 		factory:       factory,
 		sandboxes:     make(map[string]vmm.VM),
 		rootFSManager: rootFSManager,
+		store:         store,
 		dataDir:       config.DataDir,
 	}, nil
 }
@@ -157,6 +162,25 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 
 	m.sandboxes[id] = vm
 
+	// Save metadata to store
+	meta := &SandboxMeta{
+		ID:          id,
+		VMM:         vmmName,
+		VCPUs:       opts.VCPUs,
+		MemoryMB:    opts.Memory.SizeMB,
+		Image:       opts.Image,
+		RootFS:      opts.RootFS.Path,
+		Cmdline:     bootConfig.Cmdline,
+		State:       vmm.VMStatePending,
+		SnapshotKey: bootConfig.SnapshotKey,
+		MountPath:   bootConfig.MountPath,
+		CreatedAt:   time.Now().Format(time.RFC3339),
+	}
+	if err := m.store.Save(meta); err != nil {
+		// Log error but don't fail
+		fmt.Printf("Warning: failed to save sandbox metadata: %v\n", err)
+	}
+
 	// Auto-start if requested
 	if opts.AutoStart {
 		if err := vm.Start(ctx); err != nil {
@@ -196,12 +220,27 @@ func (m *Manager) List(ctx context.Context) ([]vmm.VMInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	metas, err := m.store.List()
+	if err != nil {
+		return nil, err
+	}
+
 	var infos []vmm.VMInfo
-	for _, vm := range m.sandboxes {
-		info, err := vm.Info(ctx)
-		if err != nil {
-			continue
+	for _, meta := range metas {
+		info := vmm.VMInfo{
+			ID:       meta.ID,
+			State:    meta.State,
+			VCPUs:    meta.VCPUs,
+			MemoryMB: meta.MemoryMB,
 		}
+
+		// Try to get runtime info if VM is in memory
+		if vm, ok := m.sandboxes[meta.ID]; ok {
+			if runtimeInfo, err := vm.Info(ctx); err == nil {
+				info = runtimeInfo
+			}
+		}
+
 		infos = append(infos, info)
 	}
 
@@ -307,6 +346,10 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 	// Need to track the snapshot key in the VM or sandbox metadata
 
 	delete(m.sandboxes, id)
+
+	// Delete metadata from store
+	_ = m.store.Delete(id)
+
 	return nil
 }
 
