@@ -196,13 +196,11 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 		}
 	}
 
-	vm, err := manager.Create(ctx, flags.ID, opts)
-	if err != nil {
+	if err := manager.Create(ctx, flags.ID, opts); err != nil {
 		return err
 	}
 
-	info, _ := vm.Info(ctx)
-	fmt.Printf("Created sandbox %s (State: %s)\n", flags.ID, info.State)
+	fmt.Printf("Created sandbox %s\n", flags.ID)
 	return nil
 }
 
@@ -219,13 +217,9 @@ func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) e
 		return fmt.Errorf("-id is required")
 	}
 
-	vm, err := manager.Get(id)
+	vm, err := manager.Get(ctx, id)
 	if err != nil {
-		// Check if this is a "not running" error, provide helpful message
-		if err.Error() == fmt.Sprintf("sandbox %s is not running (use 'create' to recreate or implement restore)", id) {
-			return fmt.Errorf("sandbox %s exists but is not running. Please use 'create' command with -id %s to recreate it", id, id)
-		}
-		return err
+		return fmt.Errorf("failed to load sandbox %s: %w", id, err)
 	}
 
 	if err := vm.Start(ctx); err != nil {

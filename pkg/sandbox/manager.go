@@ -4,6 +4,8 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -80,18 +82,11 @@ type CreateOptions struct {
 }
 
 // Create creates a new sandbox with the given options.
-// If KernelImage is specified, it will:
-// 1. Pull the OCI image
-// 2. Create a snapshot (rootfs) from the image
-// 3. Extract kernel and initrd paths from the rootfs
-// 4. Use these paths to start the VM
-func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vmm.VM, error) {
+// It prepares the rootfs from OCI image and saves metadata,
+// but does not create the VM instance (that happens in LoadVM).
+func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	if _, exists := m.sandboxes[id]; exists {
-		return nil, fmt.Errorf("sandbox %s already exists", id)
-	}
 
 	// Use default VMM if not specified
 	vmmName := opts.VMM
@@ -99,9 +94,9 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 		vmmName = "cloud-hypervisor"
 	}
 
-	driver, ok := m.factory.Get(vmmName)
+	_, ok := m.factory.Get(vmmName)
 	if !ok {
-		return nil, fmt.Errorf("VMM driver %s not found", vmmName)
+		return fmt.Errorf("VMM driver %s not found", vmmName)
 	}
 
 	var bootConfig vmm.BootConfig
@@ -110,13 +105,13 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 	// If image is specified, prepare rootfs from OCI image
 	if opts.Image != "" {
 		if m.rootFSManager == nil {
-			return nil, fmt.Errorf("rootfs manager not initialized, cannot use image")
+			return fmt.Errorf("rootfs manager not initialized, cannot use image")
 		}
 
 		// Prepare rootfs from OCI image
 		rootfs, err := m.rootFSManager.PrepareRootFS(ctx, opts.Image, id)
 		if err != nil {
-			return nil, fmt.Errorf("failed to prepare rootfs from image %s: %w", opts.Image, err)
+			return fmt.Errorf("failed to prepare rootfs from image %s: %w", opts.Image, err)
 		}
 
 		// Set boot configuration from rootfs
@@ -130,37 +125,13 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 		// If no rootfs disk specified, we can use the snapshot mount as the rootfs
 		// This requires the VMM to support mounting a directory as a disk
 		// For now, we require the user to provide a rootfs disk or use the existing one
+		_ = rootFSConfig
 		rootFSConfig = opts.RootFS
 	} else {
 		// Use traditional boot configuration
 		// This requires manual specification of kernel and initrd paths
-		return nil, fmt.Errorf("kernel image is required (use --kernel-image)")
+		return fmt.Errorf("kernel image is required (use --kernel-image)")
 	}
-
-	vmConfig := vmm.VMConfig{
-		ID:      id,
-		VCPUs:   opts.VCPUs,
-		Memory:  opts.Memory,
-		Boot:    bootConfig,
-		RootFS:  rootFSConfig,
-		Network: opts.Network,
-		Disks:   opts.Disks,
-	}
-
-	vm, err := driver.Create(ctx, vmConfig)
-	if err != nil {
-		// Cleanup rootfs snapshot if created
-		if bootConfig.SnapshotKey != "" && m.rootFSManager != nil {
-			rootfs := &image.RootFS{
-				SnapshotKey: bootConfig.SnapshotKey,
-				MountPath:   bootConfig.MountPath,
-			}
-			_ = rootfs.Cleanup(ctx, m.rootFSManager.Snapshotter())
-		}
-		return nil, fmt.Errorf("failed to create VM: %w", err)
-	}
-
-	m.sandboxes[id] = vm
 
 	// Save metadata to store
 	meta := &SandboxMeta{
@@ -177,51 +148,94 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 		CreatedAt:   time.Now().Format(time.RFC3339),
 	}
 	if err := m.store.Save(meta); err != nil {
-		// Log error but don't fail
-		fmt.Printf("Warning: failed to save sandbox metadata: %v\n", err)
+		return fmt.Errorf("failed to save sandbox metadata: %w", err)
 	}
 
-	// Auto-start if requested
-	if opts.AutoStart {
-		if err := vm.Start(ctx); err != nil {
-			// Cleanup on start failure
-			_ = vm.ForceStop(ctx)
-			delete(m.sandboxes, id)
-			// Cleanup rootfs snapshot
-			if bootConfig.SnapshotKey != "" && m.rootFSManager != nil {
-				rootfs := &image.RootFS{
-					SnapshotKey: bootConfig.SnapshotKey,
-					MountPath:   bootConfig.MountPath,
-				}
-				_ = rootfs.Cleanup(ctx, m.rootFSManager.Snapshotter())
-			}
-			return nil, fmt.Errorf("failed to start VM: %w", err)
-		}
-	}
-
-	return vm, nil
+	return nil
 }
 
 // Get retrieves a sandbox by ID.
-// If the VM is not in memory, it will try to load from persisted metadata.
-func (m *Manager) Get(id string) (vmm.VM, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// If the VM is not in memory, it will load from persisted metadata.
+func (m *Manager) Get(ctx context.Context, id string) (vmm.VM, error) {
+	return m.LoadVM(ctx, id)
+}
 
-	// First check if VM is already in memory
+// LoadVM loads or creates a VM instance from persisted metadata.
+func (m *Manager) LoadVM(ctx context.Context, id string) (vmm.VM, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if already loaded
 	if vm, ok := m.sandboxes[id]; ok {
 		return vm, nil
 	}
 
-	// Try to load from persisted metadata to verify sandbox exists
-	_, err := m.store.Load(id)
+	// Load metadata
+	meta, err := m.store.Load(id)
 	if err != nil {
-		return nil, fmt.Errorf("sandbox %s not found", id)
+		return nil, err
 	}
 
-	// VM exists in metadata but not in memory - it's not running
-	// The caller needs to recreate or restore it
-	return nil, fmt.Errorf("sandbox %s is not running (use 'create' to recreate or implement restore)", id)
+	// Check if snapshot is still mounted
+	if meta.SnapshotKey == "" || meta.MountPath == "" {
+		return nil, fmt.Errorf("sandbox %s has no rootfs snapshot", id)
+	}
+
+	// Check if mount still exists
+	if _, err := os.Stat(meta.MountPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("sandbox %s rootfs mount not found at %s", id, meta.MountPath)
+	}
+
+	// Get driver
+	driver, ok := m.factory.Get(meta.VMM)
+	if !ok {
+		return nil, fmt.Errorf("VMM driver %s not available", meta.VMM)
+	}
+
+	// Build VM config from metadata
+	// Kernel and initrd paths should be in the mount path
+	kernelPath := filepath.Join(meta.MountPath, "boot/vmlinuz")
+	initrdPath := filepath.Join(meta.MountPath, "boot/initrd.img")
+
+	// Check if files exist (try alternate paths)
+	if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
+		kernelPath = filepath.Join(meta.MountPath, "boot/bzImage")
+	}
+	if _, err := os.Stat(initrdPath); os.IsNotExist(err) {
+		initrdPath = "" // Optional
+	}
+
+	vmConfig := vmm.VMConfig{
+		ID:     meta.ID,
+		VCPUs:  meta.VCPUs,
+		Memory: vmm.MemoryConfig{SizeMB: meta.MemoryMB},
+		Boot: vmm.BootConfig{
+			KernelPath:  kernelPath,
+			InitrdPath:  initrdPath,
+			Cmdline:     meta.Cmdline,
+			SnapshotKey: meta.SnapshotKey,
+			MountPath:   meta.MountPath,
+		},
+	}
+
+	if meta.RootFS != "" {
+		vmConfig.RootFS = vmm.DiskConfig{
+			Path:     meta.RootFS,
+			ReadOnly: false,
+			Format:   "raw",
+		}
+	}
+
+	// Create VM instance
+	vm, err := driver.Create(ctx, vmConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VM from metadata: %w", err)
+	}
+
+	// Save to memory
+	m.sandboxes[id] = vm
+
+	return vm, nil
 }
 
 // List returns all managed sandboxes.
@@ -258,7 +272,7 @@ func (m *Manager) List(ctx context.Context) ([]vmm.VMInfo, error) {
 
 // Stop stops a sandbox gracefully.
 func (m *Manager) Stop(ctx context.Context, id string, force bool) error {
-	vm, err := m.Get(id)
+	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -272,7 +286,7 @@ func (m *Manager) Stop(ctx context.Context, id string, force bool) error {
 
 // Pause pauses a running sandbox.
 func (m *Manager) Pause(ctx context.Context, id string) error {
-	vm, err := m.Get(id)
+	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -282,7 +296,7 @@ func (m *Manager) Pause(ctx context.Context, id string) error {
 
 // Resume resumes a paused sandbox.
 func (m *Manager) Resume(ctx context.Context, id string) error {
-	vm, err := m.Get(id)
+	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -298,7 +312,7 @@ type SnapshotOptions struct {
 
 // Snapshot creates a snapshot of a sandbox.
 func (m *Manager) Snapshot(ctx context.Context, id string, opts SnapshotOptions) error {
-	vm, err := m.Get(id)
+	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -318,7 +332,7 @@ type RestoreOptions struct {
 
 // Restore restores a sandbox from a snapshot.
 func (m *Manager) Restore(ctx context.Context, id string, opts RestoreOptions) error {
-	vm, err := m.Get(id)
+	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -364,7 +378,7 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 
 // Wait blocks until the specified sandbox stops.
 func (m *Manager) Wait(ctx context.Context, id string) error {
-	vm, err := m.Get(id)
+	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
 	}
