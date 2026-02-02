@@ -134,8 +134,7 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 	var memSizeMB uint32
 	var memBackend string
 	var memBackendPath string
-	var kernelPath string
-	var initrdPath string
+	var kernelImage string
 	var rootfsPath string
 	var cmdline string
 
@@ -147,15 +146,10 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 			if i < len(args) {
 				id = args[i]
 			}
-		case "--kernel":
+		case "--kernel-image":
 			i++
 			if i < len(args) {
-				kernelPath = args[i]
-			}
-		case "--initrd":
-			i++
-			if i < len(args) {
-				initrdPath = args[i]
+				kernelImage = args[i]
 			}
 		case "--rootfs":
 			i++
@@ -202,14 +196,8 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 	if id == "" {
 		return fmt.Errorf("--id is required")
 	}
-	if kernelPath == "" {
-		return fmt.Errorf("--kernel is required")
-	}
-	if initrdPath == "" {
-		return fmt.Errorf("--initrd is required")
-	}
-	if rootfsPath == "" {
-		return fmt.Errorf("--rootfs is required")
+	if kernelImage == "" {
+		return fmt.Errorf("--kernel-image is required")
 	}
 
 	// Default values
@@ -223,18 +211,16 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 		cmdline = "console=hvc0 root=/dev/vda1 rw"
 	}
 
-	// Build boot configuration (kernel + initrd)
-	opts.Boot = vmm.BootConfig{
-		KernelPath: kernelPath,
-		InitrdPath: initrdPath,
-		Cmdline:    cmdline,
-	}
+	// Set kernel image
+	opts.KernelImage = kernelImage
 
-	// Build rootfs as virtio disk
-	opts.RootFS = vmm.DiskConfig{
-		Path:     rootfsPath,
-		ReadOnly: false,
-		Format:   "raw",
+	// Build rootfs as virtio disk (if provided)
+	if rootfsPath != "" {
+		opts.RootFS = vmm.DiskConfig{
+			Path:     rootfsPath,
+			ReadOnly: false,
+			Format:   "raw",
+		}
 	}
 
 	// Build memory configuration
@@ -243,6 +229,11 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 	if memBackend == "file" {
 		opts.Memory.Backend = vmm.MemoryBackendFile
 		opts.Memory.BackendPath = memBackendPath
+	}
+
+	// Set kernel command line
+	opts.Boot = vmm.BootConfig{
+		Cmdline: cmdline,
 	}
 
 	vm, err := manager.Create(ctx, id, opts)

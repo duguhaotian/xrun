@@ -13,11 +13,11 @@ import (
 
 // Manager handles the lifecycle of multiple sandboxes.
 type Manager struct {
-	factory     *vmm.Factory
-	sandboxes   map[string]vmm.VM
-	dataDir     string
-	imageClient *image.Client
-	mu          sync.RWMutex
+	factory       *vmm.Factory
+	sandboxes     map[string]vmm.VM
+	rootFSManager *image.RootFSManager
+	dataDir       string
+	mu            sync.RWMutex
 }
 
 // Config contains manager configuration.
@@ -31,8 +31,8 @@ type Config struct {
 
 // NewManager creates a new sandbox manager.
 func NewManager(config Config, factory *vmm.Factory) (*Manager, error) {
-	// Initialize image client if containerd address is provided
-	var imageClient *image.Client
+	// Initialize rootfs manager if containerd address is provided
+	var rootFSManager *image.RootFSManager
 	if config.ContainerdAddress != "" {
 		client, err := image.NewClient(
 			config.ContainerdAddress,
@@ -42,21 +42,21 @@ func NewManager(config Config, factory *vmm.Factory) (*Manager, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create image client: %w", err)
 		}
-		imageClient = client
+		rootFSManager = image.NewRootFSManager(client, config.DataDir)
 	}
 
 	return &Manager{
-		factory:     factory,
-		sandboxes:   make(map[string]vmm.VM),
-		dataDir:     config.DataDir,
-		imageClient: imageClient,
+		factory:       factory,
+		sandboxes:     make(map[string]vmm.VM),
+		rootFSManager: rootFSManager,
+		dataDir:       config.DataDir,
 	}, nil
 }
 
 // Close closes the manager and releases resources.
 func (m *Manager) Close() error {
-	if m.imageClient != nil {
-		return m.imageClient.Close()
+	if m.rootFSManager != nil {
+		// TODO: Cleanup all active rootfs snapshots
 	}
 	return nil
 }
@@ -66,15 +66,20 @@ type CreateOptions struct {
 	VMM         string // VMM driver to use (default: cloud-hypervisor)
 	VCPUs       uint32
 	Memory      vmm.MemoryConfig // Memory configuration with backend
-	Boot        vmm.BootConfig   // Boot configuration (kernel + initrd)
-	RootFS      vmm.DiskConfig   // Root filesystem passed as virtio disk
 	Network     vmm.NetworkConfig
 	Disks       []vmm.DiskConfig // Additional disks
 	AutoStart   bool
-	KernelImage string // OCI image reference for kernel (optional)
+	KernelImage string         // OCI image reference containing kernel and initrd
+	RootFS      vmm.DiskConfig // Root filesystem disk (optional if using kernel image)
+	Boot        vmm.BootConfig // Boot configuration (cmdline only when using kernel image)
 }
 
 // Create creates a new sandbox with the given options.
+// If KernelImage is specified, it will:
+// 1. Pull the OCI image
+// 2. Create a snapshot (rootfs) from the image
+// 3. Extract kernel and initrd paths from the rootfs
+// 4. Use these paths to start the VM
 func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vmm.VM, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -94,24 +99,37 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 		return nil, fmt.Errorf("VMM driver %s not found", vmmName)
 	}
 
-	// Resolve kernel image if specified
-	bootConfig := opts.Boot
+	var bootConfig vmm.BootConfig
+	var rootFSConfig vmm.DiskConfig
+
+	// If kernel image is specified, prepare rootfs from OCI image
 	if opts.KernelImage != "" {
-		if m.imageClient == nil {
-			return nil, fmt.Errorf("image client not initialized, cannot use kernel image")
+		if m.rootFSManager == nil {
+			return nil, fmt.Errorf("rootfs manager not initialized, cannot use kernel image")
 		}
 
-		resolver := image.NewKernelResolver(m.imageClient)
-		bundle, err := resolver.Resolve(ctx, opts.KernelImage)
+		// Prepare rootfs from OCI image
+		rootfs, err := m.rootFSManager.PrepareRootFS(ctx, opts.KernelImage, id)
 		if err != nil {
-			return nil, fmt.Errorf("failed to resolve kernel image %s: %w", opts.KernelImage, err)
+			return nil, fmt.Errorf("failed to prepare rootfs from image %s: %w", opts.KernelImage, err)
 		}
 
-		// Update boot config with resolved paths
-		bootConfig.KernelPath = bundle.KernelPath
-		bootConfig.InitrdPath = bundle.InitrdPath
-		bootConfig.SnapshotKey = bundle.SnapshotKey
-		bootConfig.MountPath = bundle.MountPath
+		// Set boot configuration from rootfs
+		bootConfig = vmm.BootConfig{
+			KernelPath:  rootfs.KernelPath,
+			InitrdPath:  rootfs.InitrdPath,
+			SnapshotKey: rootfs.SnapshotKey,
+			MountPath:   rootfs.MountPath,
+		}
+
+		// If no rootfs disk specified, we can use the snapshot mount as the rootfs
+		// This requires the VMM to support mounting a directory as a disk
+		// For now, we require the user to provide a rootfs disk or use the existing one
+		rootFSConfig = opts.RootFS
+	} else {
+		// Use traditional boot configuration
+		// This requires manual specification of kernel and initrd paths
+		return nil, fmt.Errorf("kernel image is required (use --kernel-image)")
 	}
 
 	vmConfig := vmm.VMConfig{
@@ -119,20 +137,20 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 		VCPUs:   opts.VCPUs,
 		Memory:  opts.Memory,
 		Boot:    bootConfig,
-		RootFS:  opts.RootFS,
+		RootFS:  rootFSConfig,
 		Network: opts.Network,
 		Disks:   opts.Disks,
 	}
 
 	vm, err := driver.Create(ctx, vmConfig)
 	if err != nil {
-		// Cleanup kernel snapshot if created
-		if bootConfig.SnapshotKey != "" && m.imageClient != nil {
-			bundle := &image.KernelBundle{
+		// Cleanup rootfs snapshot if created
+		if bootConfig.SnapshotKey != "" && m.rootFSManager != nil {
+			rootfs := &image.RootFS{
 				SnapshotKey: bootConfig.SnapshotKey,
 				MountPath:   bootConfig.MountPath,
 			}
-			_ = bundle.Release(ctx, m.imageClient.Snapshotter())
+			_ = rootfs.Cleanup(ctx, m.rootFSManager.Snapshotter())
 		}
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
@@ -145,13 +163,13 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 			// Cleanup on start failure
 			_ = vm.ForceStop(ctx)
 			delete(m.sandboxes, id)
-			// Cleanup kernel snapshot
-			if bootConfig.SnapshotKey != "" && m.imageClient != nil {
-				bundle := &image.KernelBundle{
+			// Cleanup rootfs snapshot
+			if bootConfig.SnapshotKey != "" && m.rootFSManager != nil {
+				rootfs := &image.RootFS{
 					SnapshotKey: bootConfig.SnapshotKey,
 					MountPath:   bootConfig.MountPath,
 				}
-				_ = bundle.Release(ctx, m.imageClient.Snapshotter())
+				_ = rootfs.Cleanup(ctx, m.rootFSManager.Snapshotter())
 			}
 			return nil, fmt.Errorf("failed to start VM: %w", err)
 		}
@@ -285,7 +303,8 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 		}
 	}
 
-	// TODO: Cleanup kernel snapshot if VM was created with kernel image
+	// TODO: Cleanup rootfs snapshot if VM was created with kernel image
+	// Need to track the snapshot key in the VM or sandbox metadata
 
 	delete(m.sandboxes, id)
 	return nil
