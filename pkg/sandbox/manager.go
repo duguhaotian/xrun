@@ -203,16 +203,25 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 }
 
 // Get retrieves a sandbox by ID.
+// If the VM is not in memory, it will try to load from persisted metadata.
 func (m *Manager) Get(id string) (vmm.VM, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	vm, ok := m.sandboxes[id]
-	if !ok {
+	// First check if VM is already in memory
+	if vm, ok := m.sandboxes[id]; ok {
+		return vm, nil
+	}
+
+	// Try to load from persisted metadata to verify sandbox exists
+	_, err := m.store.Load(id)
+	if err != nil {
 		return nil, fmt.Errorf("sandbox %s not found", id)
 	}
 
-	return vm, nil
+	// VM exists in metadata but not in memory - it's not running
+	// The caller needs to recreate or restore it
+	return nil, fmt.Errorf("sandbox %s is not running (use 'create' to recreate or implement restore)", id)
 }
 
 // List returns all managed sandboxes.

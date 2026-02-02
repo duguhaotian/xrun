@@ -221,6 +221,10 @@ func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) e
 
 	vm, err := manager.Get(id)
 	if err != nil {
+		// Check if this is a "not running" error, provide helpful message
+		if err.Error() == fmt.Sprintf("sandbox %s is not running (use 'create' to recreate or implement restore)", id) {
+			return fmt.Errorf("sandbox %s exists but is not running. Please use 'create' command with -id %s to recreate it", id, id)
+		}
 		return err
 	}
 
