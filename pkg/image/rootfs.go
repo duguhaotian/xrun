@@ -37,14 +37,18 @@ func NewRootFSManager(client *Client, dataDir string) *RootFSManager {
 	}
 }
 
-// PrepareRootFS pulls an image, creates a snapshot, and extracts kernel/initrd paths.
+// PrepareRootFS pulls an image (if not exists), creates a snapshot, and extracts kernel/initrd paths.
 func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID string) (*RootFS, error) {
 	ctx = namespaces.WithNamespace(ctx, m.client.namespace)
 
-	// Pull the image
-	img, err := m.client.PullImage(ctx, imageRef)
+	// Try to get image from local first
+	img, err := m.client.GetImage(ctx, imageRef)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pull image %s: %w", imageRef, err)
+		// Image not found locally, pull it
+		img, err = m.client.PullImage(ctx, imageRef)
+		if err != nil {
+			return nil, fmt.Errorf("failed to pull image %s: %w", imageRef, err)
+		}
 	}
 
 	// Unpack the image to snapshotter
