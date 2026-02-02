@@ -2,7 +2,7 @@
 # See AGENTS.md for detailed project guidelines
 
 # Variables
-BINARY_NAME := sandboxd
+BINARY_NAME := xrun
 BINARY_PATH := bin/$(BINARY_NAME)
 GO := go
 GOPATH := $(shell $(GO) env GOPATH)
@@ -16,12 +16,12 @@ all: build
 .PHONY: build
 build: ## Build the CLI binary
 	@mkdir -p bin
-	$(GO) build -o $(BINARY_PATH) ./cmd/sandboxd
+	$(GO) build -o $(BINARY_PATH) ./cmd/xrun
 
 .PHONY: build-prod
 build-prod: ## Build production binary (stripped)
 	@mkdir -p bin
-	$(GO) build $(LDFLAGS) -o $(BINARY_PATH) ./cmd/sandboxd
+	$(GO) build $(LDFLAGS) -o $(BINARY_PATH) ./cmd/xrun
 
 .PHONY: build-all
 build-all: ## Build all packages

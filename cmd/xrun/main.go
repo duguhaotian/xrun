@@ -86,10 +86,10 @@ func printUsage() error {
 	fmt.Println(`MicroVM Sandbox Manager
 
 Usage:
-  sandboxd <command> [options]
+  xrun <command> [options]
 
 Commands:
-  create     Create a new sandbox
+  create     Create a new sandbox from OCI image
   start      Start an existing sandbox
   stop       Stop a running sandbox
   list       List all sandboxes
@@ -101,30 +101,29 @@ Commands:
   help       Show this help message
 
 Create Options:
-  --id         Sandbox identifier (required)
-  --kernel     Path to kernel image (required)
-  --initrd     Path to initrd/initramfs image (required)
-  --rootfs     Path to root filesystem disk image (required, passed as virtio disk)
-  --vcpus      Number of vCPUs (default: 1)
-  --memory     Memory size in MB (default: 512)
-  --mem-backend Memory backend type: anonymous, file (default: anonymous)
-  --mem-file   Path to memory backend file (when mem-backend=file)
-  --cmdline    Kernel command line (default: "console=hvc0 root=/dev/vda1 rw")
-  --vmm        VMM driver to use (default: cloud-hypervisor)
-  --start      Auto-start the VM after creation
+  --id            Sandbox identifier (required)
+  --image         OCI image reference containing kernel and initrd (required)
+  --rootfs        Path to root filesystem disk image (optional, passed as virtio disk)
+  --vcpus         Number of vCPUs (default: 1)
+  --memory        Memory size in MB (default: 512)
+  --mem-backend   Memory backend type: anonymous, file (default: anonymous)
+  --mem-file      Path to memory backend file (when mem-backend=file)
+  --cmdline       Kernel command line (default: "console=hvc0 root=/dev/vda1 rw")
+  --vmm           VMM driver to use (default: cloud-hypervisor)
+  --start         Auto-start the VM after creation
 
 Examples:
-  # Create with kernel+initrd, rootfs as virtio disk
-  sandboxd create --id myvm --kernel /path/to/vmlinux --initrd /path/to/initrd.img --rootfs /path/to/rootfs.img --vcpus 2 --memory 1024
+  # Create sandbox from OCI image (kernel and initrd extracted from image)
+  xrun create --id myvm --image docker.io/myrepo/vm-image:v1.0 --rootfs /path/to/rootfs.img --vcpus 2 --memory 1024
 
   # With custom cmdline
-  sandboxd create --id myvm --kernel /path/to/vmlinux --initrd /path/to/initrd.img --rootfs /path/to/rootfs.img --cmdline "console=ttyS0 root=/dev/vda1 rw quiet"
+  xrun create --id myvm --image docker.io/myrepo/vm-image:v1.0 --rootfs /path/to/rootfs.img --cmdline "console=ttyS0 root=/dev/vda1 rw quiet"
 
-  sandboxd start --id myvm
-  sandboxd stop --id myvm
-  sandboxd list
-  sandboxd snapshot --id myvm --dest /path/to/snapshot
-  sandboxd restore --id myvm --source /path/to/snapshot`)
+  xrun start --id myvm
+  xrun stop --id myvm
+  xrun list
+  xrun snapshot --id myvm --dest /path/to/snapshot
+  xrun restore --id myvm --source /path/to/snapshot`)
 	return nil
 }
 
@@ -146,7 +145,7 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 			if i < len(args) {
 				id = args[i]
 			}
-		case "--kernel-image":
+		case "--image":
 			i++
 			if i < len(args) {
 				kernelImage = args[i]
@@ -197,7 +196,7 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 		return fmt.Errorf("--id is required")
 	}
 	if kernelImage == "" {
-		return fmt.Errorf("--kernel-image is required")
+		return fmt.Errorf("--image is required")
 	}
 
 	// Default values
@@ -211,8 +210,8 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 		cmdline = "console=hvc0 root=/dev/vda1 rw"
 	}
 
-	// Set kernel image
-	opts.KernelImage = kernelImage
+	// Set image
+	opts.Image = kernelImage
 
 	// Build rootfs as virtio disk (if provided)
 	if rootfsPath != "" {

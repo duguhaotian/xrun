@@ -16,10 +16,10 @@ This is a **microVM sandbox management** project.
 go build ./...
 
 # Build CLI binary
-go build -o bin/sandboxd ./cmd/sandboxd
+go build -o bin/xrun ./cmd/xrun
 
 # Build for production (stripped)
-go build -ldflags="-s -w" -o bin/sandboxd ./cmd/sandboxd
+go build -ldflags="-s -w" -o bin/xrun ./cmd/xrun
 ```
 
 ### Test Commands
@@ -133,7 +133,7 @@ if err := doSomething(); err != nil {
 ```
 .
 ├── cmd/
-│   └── sandboxd/        # Main CLI application
+│   └── xrun/           # Main CLI application
 │       └── main.go
 ├── pkg/
 │   ├── vmm/            # VMM abstraction layer
@@ -173,7 +173,7 @@ When implementing a new VMM driver:
 1. Create package under `pkg/vmm/<driver>/`
 2. Implement the `vmm.Driver` interface
 3. Implement the `vmm.VM` interface for VM instances
-4. Register driver in `cmd/sandboxd/main.go`
+4. Register driver in `cmd/xrun/main.go`
 5. Add tests for all operations
 
 ## Security Notes

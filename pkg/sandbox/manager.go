@@ -63,15 +63,15 @@ func (m *Manager) Close() error {
 
 // CreateOptions contains options for creating a sandbox.
 type CreateOptions struct {
-	VMM         string // VMM driver to use (default: cloud-hypervisor)
-	VCPUs       uint32
-	Memory      vmm.MemoryConfig // Memory configuration with backend
-	Network     vmm.NetworkConfig
-	Disks       []vmm.DiskConfig // Additional disks
-	AutoStart   bool
-	KernelImage string         // OCI image reference containing kernel and initrd
-	RootFS      vmm.DiskConfig // Root filesystem disk (optional if using kernel image)
-	Boot        vmm.BootConfig // Boot configuration (cmdline only when using kernel image)
+	VMM       string // VMM driver to use (default: cloud-hypervisor)
+	VCPUs     uint32
+	Memory    vmm.MemoryConfig // Memory configuration with backend
+	Network   vmm.NetworkConfig
+	Disks     []vmm.DiskConfig // Additional disks
+	AutoStart bool
+	Image     string         // OCI image reference containing kernel and initrd
+	RootFS    vmm.DiskConfig // Root filesystem disk (optional if using image)
+	Boot      vmm.BootConfig // Boot configuration (cmdline only when using image)
 }
 
 // Create creates a new sandbox with the given options.
@@ -102,16 +102,16 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) (vm
 	var bootConfig vmm.BootConfig
 	var rootFSConfig vmm.DiskConfig
 
-	// If kernel image is specified, prepare rootfs from OCI image
-	if opts.KernelImage != "" {
+	// If image is specified, prepare rootfs from OCI image
+	if opts.Image != "" {
 		if m.rootFSManager == nil {
-			return nil, fmt.Errorf("rootfs manager not initialized, cannot use kernel image")
+			return nil, fmt.Errorf("rootfs manager not initialized, cannot use image")
 		}
 
 		// Prepare rootfs from OCI image
-		rootfs, err := m.rootFSManager.PrepareRootFS(ctx, opts.KernelImage, id)
+		rootfs, err := m.rootFSManager.PrepareRootFS(ctx, opts.Image, id)
 		if err != nil {
-			return nil, fmt.Errorf("failed to prepare rootfs from image %s: %w", opts.KernelImage, err)
+			return nil, fmt.Errorf("failed to prepare rootfs from image %s: %w", opts.Image, err)
 		}
 
 		// Set boot configuration from rootfs
