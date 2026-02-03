@@ -292,23 +292,30 @@ func (s *Server) Stop(ctx context.Context, req *pb.StopRequest) (*pb.StopRespons
 	log.Info("Stop request: id=%s, force=%v", req.Id, req.Force)
 
 	// First check if sandbox exists and is running
+	log.Debug("[Stop] Loading sandbox %s from store", req.Id)
 	meta, err := s.store.Load(req.Id)
 	if err != nil {
+		log.Error("[Stop] Failed to load sandbox %s: %v", req.Id, err)
 		return nil, fmt.Errorf("sandbox %s not found", req.Id)
 	}
+	log.Debug("[Stop] Sandbox %s loaded, state=%s", req.Id, meta.State)
+
 	if meta.State != vmm.VMStateRunning {
+		log.Warn("[Stop] Sandbox %s is not running (state=%s)", req.Id, meta.State)
 		return nil, fmt.Errorf("sandbox %s is not running", req.Id)
 	}
 
+	log.Debug("[Stop] Acquiring runtime lock for sandbox %s", req.Id)
 	s.mu.Lock()
 	runtime, ok := s.sandboxes[req.Id]
 	s.mu.Unlock()
+	log.Debug("[Stop] Runtime lock released, sandbox %s in cache=%v", req.Id, ok)
 
 	if !ok {
 		// Sandbox is marked as running in store but not in runtime cache
 		// This can happen if the daemon was restarted
 		// Just update the state to stopped
-		log.Warn("Sandbox %s is marked as running but not in runtime cache, updating state to stopped", req.Id)
+		log.Warn("[Stop] Sandbox %s is marked as running but not in runtime cache, updating state to stopped", req.Id)
 		if err := s.store.UpdateState(req.Id, vmm.VMStateStopped); err != nil {
 			return nil, fmt.Errorf("failed to update sandbox state: %w", err)
 		}
@@ -319,35 +326,44 @@ func (s *Server) Stop(ctx context.Context, req *pb.StopRequest) (*pb.StopRespons
 	}
 
 	// Stop VM
+	log.Info("[Stop] Stopping VM for sandbox %s (force=%v)", req.Id, req.Force)
 	var stopErr error
 	if req.Force {
+		log.Debug("[Stop] Calling ForceStop for sandbox %s", req.Id)
 		stopErr = runtime.VM.ForceStop(ctx)
 	} else {
+		log.Debug("[Stop] Calling Stop for sandbox %s", req.Id)
 		stopErr = runtime.VM.Stop(ctx)
 	}
+	log.Info("[Stop] VM stop completed for sandbox %s, err=%v", req.Id, stopErr)
 
 	if stopErr != nil {
 		return nil, fmt.Errorf("failed to stop VM: %w", stopErr)
 	}
 
 	// Update metadata
+	log.Debug("[Stop] Updating state to stopped for sandbox %s", req.Id)
 	if err := s.store.UpdateState(req.Id, vmm.VMStateStopped); err != nil {
-		log.Warn("Failed to update state: %v", err)
+		log.Warn("[Stop] Failed to update state: %v", err)
 	}
 
 	// Cleanup network
+	log.Debug("[Stop] Cleaning up network for sandbox %s", req.Id)
 	if err := s.netMgr.Cleanup(ctx, req.Id, runtime.NetNS); err != nil {
-		log.Warn("Failed to cleanup network: %v", err)
+		log.Warn("[Stop] Failed to cleanup network: %v", err)
 	}
 
 	// Release image
+	log.Debug("[Stop] Releasing image for sandbox %s", req.Id)
 	s.imageCache.Release(runtime.ImageRef)
 
 	// Remove from runtime
+	log.Debug("[Stop] Removing sandbox %s from runtime cache", req.Id)
 	s.mu.Lock()
 	delete(s.sandboxes, req.Id)
 	s.mu.Unlock()
 
+	log.Info("[Stop] Sandbox %s stopped successfully", req.Id)
 	return &pb.StopResponse{
 		Id:    req.Id,
 		State: string(vmm.VMStateStopped),

@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -112,41 +111,11 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		return fmt.Errorf("VM is already running")
 	}
 
+	// Build log file path for cloud-hypervisor
 	args := vm.buildArgs()
-
-	// Build log file path
-	logFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "vm.log")
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
-	}
-	defer f.Close()
-
-	// Log command
-	cmdStr := vm.driver.binaryPath + " " + strings.Join(args, " ")
-	fmt.Fprintf(f, "[%s] Starting VM with command: %s\n", time.Now().Format("2006-01-02 15:04:05"), cmdStr)
-	f.Sync()
-
-	// Create stdout/stderr log files
-	stdoutFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "vm.stdout.log")
-	stderrFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "vm.stderr.log")
-
-	stdoutF, err := os.OpenFile(stdoutFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open stdout log file: %w", err)
-	}
-	defer stdoutF.Close()
-
-	stderrF, err := os.OpenFile(stderrFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open stderr log file: %w", err)
-	}
-	defer stderrF.Close()
 
 	// Create command
 	vm.cmd = exec.Command(vm.driver.binaryPath, args...)
-	vm.cmd.Stdout = stdoutF
-	vm.cmd.Stderr = stderrF
 	vm.cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true,
 	}
@@ -184,41 +153,55 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 
 // Stop stops the VM gracefully.
 func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
+	log.Info("[VM.Stop] Stopping VM %s (current state: %s)", vm.id, vm.state)
+
 	if vm.state != vmm.VMStateRunning {
+		log.Warn("[VM.Stop] VM %s is not running (state: %s)", vm.id, vm.state)
 		return fmt.Errorf("VM is not running")
 	}
 
 	// Send shutdown via API
+	log.Debug("[VM.Stop] Sending shutdown API call for VM %s", vm.id)
 	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	if err := vm.sendAPICall(shutdownCtx, http.MethodPut, "/vm.shutdown", nil); err != nil {
-		log.Warn("Failed to send shutdown API call, will try force stop: %v", err)
+		log.Warn("[VM.Stop] Failed to send shutdown API call for VM %s: %v, will try force stop", vm.id, err)
 		return vm.ForceStop(ctx)
 	}
+	log.Debug("[VM.Stop] Shutdown API call sent successfully for VM %s", vm.id)
 
 	// Wait for process to exit
+	log.Debug("[VM.Stop] Waiting for VM %s process to exit", vm.id)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	timeout := time.After(30 * time.Second)
+	checkCount := 0
 
 	for {
 		select {
 		case <-ctx.Done():
+			log.Warn("[VM.Stop] Context cancelled while waiting for VM %s to stop", vm.id)
 			return ctx.Err()
 		case <-timeout:
-			log.Warn("VM shutdown timeout after 30s, forcing stop")
+			log.Warn("[VM.Stop] VM %s shutdown timeout after 30s (checked %d times), forcing stop", vm.id, checkCount)
 			return vm.ForceStop(ctx)
 		case <-ticker.C:
+			checkCount++
 			// Check if process has actually exited
 			if vm.cmd != nil && vm.cmd.Process != nil {
 				if err := vm.cmd.Process.Signal(syscall.Signal(0)); err != nil {
 					// Process has exited
+					log.Info("[VM.Stop] VM %s process has exited after %d checks", vm.id, checkCount)
 					vm.state = vmm.VMStateStopped
 					return nil
 				}
+				if checkCount%50 == 0 { // Log every 5 seconds
+					log.Debug("[VM.Stop] VM %s process still running after %d checks", vm.id, checkCount)
+				}
 			} else {
 				// No process, consider stopped
+				log.Info("[VM.Stop] VM %s has no process after %d checks, considering stopped", vm.id, checkCount)
 				vm.state = vmm.VMStateStopped
 				return nil
 			}
@@ -228,12 +211,38 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 
 // ForceStop forcefully stops the VM.
 func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
+	log.Info("[VM.ForceStop] Force stopping VM %s", vm.id)
+
 	if vm.cmd != nil && vm.cmd.Process != nil {
-		vm.cmd.Process.Signal(syscall.SIGTERM)
-		time.Sleep(2 * time.Second)
-		vm.cmd.Process.Kill()
+		log.Debug("[VM.ForceStop] Sending SIGTERM to VM %s process (PID: %d)", vm.id, vm.cmd.Process.Pid)
+		if err := vm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			log.Warn("[VM.ForceStop] Failed to send SIGTERM to VM %s: %v", vm.id, err)
+		}
+
+		// Wait for process to exit with timeout
+		done := make(chan error, 1)
+		go func() {
+			_, err := vm.cmd.Process.Wait()
+			done <- err
+		}()
+
+		select {
+		case <-done:
+			log.Debug("[VM.ForceStop] VM %s process exited after SIGTERM", vm.id)
+		case <-time.After(2 * time.Second):
+			log.Warn("[VM.ForceStop] VM %s did not exit after 2s, sending SIGKILL", vm.id)
+			if err := vm.cmd.Process.Kill(); err != nil {
+				log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+			}
+			// Wait for kill to complete
+			<-done
+		}
+	} else {
+		log.Debug("[VM.ForceStop] VM %s has no process to stop", vm.id)
 	}
+
 	vm.state = vmm.VMStateStopped
+	log.Info("[VM.ForceStop] VM %s force stopped successfully", vm.id)
 	return nil
 }
 
