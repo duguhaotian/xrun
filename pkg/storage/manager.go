@@ -102,10 +102,13 @@ func (m *Manager) CreateMemoryFile(ctx context.Context, vmID string, sizeMB uint
 	snapshotKey := fmt.Sprintf("xrun-memory-%s-%s", vmID, uuid.New().String()[:8])
 
 	// Create a snapshot with labels
+	// Note: We add "containerd.io/gc.root" label to prevent GC of this active snapshot
 	labels := map[string]string{
-		LabelMemorySnapshot: "true",
-		LabelVMID:           vmID,
-		LabelCreatedAt:      time.Now().Format(time.RFC3339),
+		LabelMemorySnapshot:              "true",
+		LabelVMID:                        vmID,
+		LabelCreatedAt:                   time.Now().Format(time.RFC3339),
+		"containerd.io/gc.root":          "true",
+		"containerd.io/gc.root.snapshot": "true",
 	}
 
 	opts := snapshots.WithLabels(labels)
@@ -139,11 +142,10 @@ func (m *Manager) CreateMemoryFile(ctx context.Context, vmID string, sizeMB uint
 		return nil, fmt.Errorf("failed to create memory file: %w", err)
 	}
 
-	// Commit the snapshot
-	if err := m.snapshotter.Commit(ctx, snapshotKey, snapshotKey); err != nil {
-		// Already committed or other error, continue
-		log.Warn("Failed to commit snapshot (may already be committed): %v", err)
-	}
+	// Note: We don't commit here for 'run' operation.
+	// The snapshot stays as an active layer (prepared but not committed).
+	// This allows the VM to write to the memory file.
+	// We add a special label to prevent GC of this active snapshot.
 
 	// Add to cache
 	m.mu.Lock()
