@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -80,24 +81,28 @@ func (d *Driver) Create(ctx context.Context, config vmm.VMConfig) (vmm.VM, error
 	return vm, nil
 }
 
-func (d *Driver) ensureDataDir(id string) error {
-	dir := filepath.Join(d.dataDir, "vms", id)
-	return os.MkdirAll(dir, 0755)
+// ensureDataDir creates the data directory for a VM.
+func (d *Driver) ensureDataDir(vmID string) error {
+	vmDir := filepath.Join(d.dataDir, "vms", vmID)
+	return os.MkdirAll(vmDir, 0755)
 }
 
-func (d *Driver) getAPISocketPath(id string) string {
-	return filepath.Join(d.dataDir, "vms", id, "api.sock")
+// getAPISocketPath returns the path to the API socket for a VM.
+func (d *Driver) getAPISocketPath(vmID string) string {
+	return filepath.Join(d.dataDir, "vms", vmID, "api.sock")
 }
 
-// cloudHypervisorVM represents a Cloud-Hypervisor VM instance.
+// cloudHypervisorVM implements the vmm.VM interface.
 type cloudHypervisorVM struct {
 	id        string
 	driver    *Driver
 	config    vmm.VMConfig
 	apiSocket string
 	cmd       *exec.Cmd
-	state     vmm.VMState
 	pid       int
+	state     vmm.VMState
+	mu        sync.RWMutex
+	waitDone  chan error
 }
 
 // ID returns the VM ID.
@@ -107,6 +112,9 @@ func (vm *cloudHypervisorVM) ID() string {
 
 // Start starts the VM.
 func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
 	if vm.state == vmm.VMStateRunning {
 		return fmt.Errorf("VM is already running")
 	}
@@ -117,7 +125,7 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create VM directory: %w", err)
 	}
 
-	// Build args with log-file parameter
+	// Build args with serial parameter
 	args := vm.buildArgs()
 
 	// Create command
@@ -141,11 +149,18 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	vm.state = vmm.VMStateRunning
 
 	// Start goroutine to wait for process
+	vm.waitDone = make(chan error, 1)
 	go func() {
+		var waitErr error
 		if err := vm.cmd.Wait(); err != nil {
 			log.Warn("VM %s exited with error: %v", vm.id, err)
+			waitErr = err
 		}
+		vm.mu.Lock()
 		vm.state = vmm.VMStateStopped
+		vm.mu.Unlock()
+		vm.waitDone <- waitErr
+		close(vm.waitDone)
 	}()
 
 	// Wait for API socket
@@ -159,10 +174,14 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 
 // Stop stops the VM gracefully.
 func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
-	log.Info("[VM.Stop] Stopping VM %s (current state: %s)", vm.id, vm.state)
+	vm.mu.RLock()
+	state := vm.state
+	vm.mu.RUnlock()
 
-	if vm.state != vmm.VMStateRunning {
-		log.Warn("[VM.Stop] VM %s is not running (state: %s)", vm.id, vm.state)
+	log.Info("[VM.Stop] Stopping VM %s (current state: %s)", vm.id, state)
+
+	if state != vmm.VMStateRunning {
+		log.Warn("[VM.Stop] VM %s is not running (state: %s)", vm.id, state)
 		return fmt.Errorf("VM is not running")
 	}
 
@@ -177,84 +196,81 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 	}
 	log.Debug("[VM.Stop] Shutdown API call sent successfully for VM %s", vm.id)
 
-	// Wait for process to exit
-	log.Debug("[VM.Stop] Waiting for VM %s process to exit", vm.id)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	timeout := time.After(30 * time.Second)
-	checkCount := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Warn("[VM.Stop] Context cancelled while waiting for VM %s to stop", vm.id)
-			return ctx.Err()
-		case <-timeout:
-			log.Warn("[VM.Stop] VM %s shutdown timeout after 30s (checked %d times), forcing stop", vm.id, checkCount)
-			return vm.ForceStop(ctx)
-		case <-ticker.C:
-			checkCount++
-			// Check if process has actually exited
-			if vm.cmd != nil && vm.cmd.Process != nil {
-				if err := vm.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-					// Process has exited
-					log.Info("[VM.Stop] VM %s process has exited after %d checks", vm.id, checkCount)
-					vm.state = vmm.VMStateStopped
-					return nil
-				}
-				if checkCount%50 == 0 { // Log every 5 seconds
-					log.Debug("[VM.Stop] VM %s process still running after %d checks", vm.id, checkCount)
-				}
-			} else {
-				// No process, consider stopped
-				log.Info("[VM.Stop] VM %s has no process after %d checks, considering stopped", vm.id, checkCount)
-				vm.state = vmm.VMStateStopped
-				return nil
-			}
-		}
+	// Wait for process to exit with timeout
+	log.Debug("[VM.Stop] Waiting for VM %s process to exit (timeout: 30s)", vm.id)
+	select {
+	case <-ctx.Done():
+		log.Warn("[VM.Stop] Context cancelled while waiting for VM %s to stop", vm.id)
+		return ctx.Err()
+	case <-time.After(30 * time.Second):
+		log.Warn("[VM.Stop] VM %s shutdown timeout after 30s, forcing stop", vm.id)
+		return vm.ForceStop(ctx)
+	case err := <-vm.waitDone:
+		log.Info("[VM.Stop] VM %s process has exited: %v", vm.id, err)
+		vm.mu.Lock()
+		vm.state = vmm.VMStateStopped
+		vm.mu.Unlock()
+		return nil
 	}
 }
 
 // ForceStop forcefully stops the VM.
 func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
-	log.Info("[VM.ForceStop] Force stopping VM %s", vm.id)
+	vm.mu.RLock()
+	cmd := vm.cmd
+	pid := vm.pid
+	vm.mu.RUnlock()
 
-	if vm.cmd != nil && vm.cmd.Process != nil {
-		log.Debug("[VM.ForceStop] Sending SIGTERM to VM %s process (PID: %d)", vm.id, vm.cmd.Process.Pid)
-		if err := vm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	log.Info("[VM.ForceStop] Force stopping VM %s (PID: %d)", vm.id, pid)
+
+	if cmd != nil && cmd.Process != nil {
+		log.Debug("[VM.ForceStop] Sending SIGTERM to VM %s process", vm.id)
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			log.Warn("[VM.ForceStop] Failed to send SIGTERM to VM %s: %v", vm.id, err)
+			// Try SIGKILL directly
+			log.Debug("[VM.ForceStop] Trying SIGKILL for VM %s", vm.id)
+			if err := cmd.Process.Kill(); err != nil {
+				log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+			}
 		}
 
 		// Wait for process to exit with timeout
-		done := make(chan error, 1)
-		go func() {
-			_, err := vm.cmd.Process.Wait()
-			done <- err
-		}()
+		vm.mu.RLock()
+		waitDone := vm.waitDone
+		vm.mu.RUnlock()
 
-		select {
-		case <-done:
-			log.Debug("[VM.ForceStop] VM %s process exited after SIGTERM", vm.id)
-		case <-time.After(2 * time.Second):
-			log.Warn("[VM.ForceStop] VM %s did not exit after 2s, sending SIGKILL", vm.id)
-			if err := vm.cmd.Process.Kill(); err != nil {
-				log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+		if waitDone != nil {
+			select {
+			case <-waitDone:
+				log.Debug("[VM.ForceStop] VM %s process exited", vm.id)
+			case <-time.After(3 * time.Second):
+				log.Warn("[VM.ForceStop] VM %s did not exit after 3s, sending SIGKILL", vm.id)
+				if err := cmd.Process.Kill(); err != nil {
+					log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+				}
+				// Wait for kill to complete
+				<-waitDone
 			}
-			// Wait for kill to complete
-			<-done
 		}
 	} else {
 		log.Debug("[VM.ForceStop] VM %s has no process to stop", vm.id)
 	}
 
+	vm.mu.Lock()
 	vm.state = vmm.VMStateStopped
+	vm.mu.Unlock()
+
 	log.Info("[VM.ForceStop] VM %s force stopped successfully", vm.id)
 	return nil
 }
 
 // Pause pauses the VM.
 func (vm *cloudHypervisorVM) Pause(ctx context.Context) error {
-	if vm.state != vmm.VMStateRunning {
+	vm.mu.RLock()
+	state := vm.state
+	vm.mu.RUnlock()
+
+	if state != vmm.VMStateRunning {
 		return fmt.Errorf("VM is not running")
 	}
 
@@ -262,13 +278,20 @@ func (vm *cloudHypervisorVM) Pause(ctx context.Context) error {
 		return fmt.Errorf("failed to pause VM: %w", err)
 	}
 
+	vm.mu.Lock()
 	vm.state = vmm.VMStatePaused
+	vm.mu.Unlock()
+
 	return nil
 }
 
-// Resume resumes a paused VM.
+// Resume resumes the VM.
 func (vm *cloudHypervisorVM) Resume(ctx context.Context) error {
-	if vm.state != vmm.VMStatePaused {
+	vm.mu.RLock()
+	state := vm.state
+	vm.mu.RUnlock()
+
+	if state != vmm.VMStatePaused {
 		return fmt.Errorf("VM is not paused")
 	}
 
@@ -276,64 +299,63 @@ func (vm *cloudHypervisorVM) Resume(ctx context.Context) error {
 		return fmt.Errorf("failed to resume VM: %w", err)
 	}
 
+	vm.mu.Lock()
 	vm.state = vmm.VMStateRunning
+	vm.mu.Unlock()
+
 	return nil
 }
 
 // Snapshot creates a snapshot of the VM.
-func (vm *cloudHypervisorVM) Snapshot(ctx context.Context, destPath string) error {
-	if vm.state != vmm.VMStateRunning && vm.state != vmm.VMStatePaused {
-		return fmt.Errorf("VM must be running or paused to create snapshot")
+func (vm *cloudHypervisorVM) Snapshot(ctx context.Context, path string) error {
+	if vm.state != vmm.VMStatePaused {
+		return fmt.Errorf("VM must be paused before snapshot")
 	}
 
-	prevState := vm.state
-	vm.state = vmm.VMStateSnapshot
-
-	snapshotReq := map[string]interface{}{
-		"destination_url": "file://" + destPath,
+	body := map[string]interface{}{
+		"destination_url": fmt.Sprintf("file://%s", path),
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.snapshot", snapshotReq); err != nil {
-		vm.state = prevState
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/create", body); err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
-	vm.state = prevState
 	return nil
 }
 
 // Restore restores the VM from a snapshot.
-func (vm *cloudHypervisorVM) Restore(ctx context.Context, sourcePath string) error {
-	if vm.state != vmm.VMStateStopped {
-		return fmt.Errorf("VM must be stopped before restore")
+func (vm *cloudHypervisorVM) Restore(ctx context.Context, path string) error {
+	body := map[string]interface{}{
+		"source_url": fmt.Sprintf("file://%s", path),
 	}
 
-	vm.state = vmm.VMStateRestoring
-
-	restoreReq := map[string]interface{}{
-		"source_url": "file://" + sourcePath,
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/restore", body); err != nil {
+		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.restore", restoreReq); err != nil {
-		vm.state = vmm.VMStateFailed
-		return fmt.Errorf("failed to restore VM: %w", err)
-	}
-
+	vm.mu.Lock()
 	vm.state = vmm.VMStateRunning
+	vm.mu.Unlock()
+
 	return nil
 }
 
-// Info returns current VM information.
+// Info returns information about the VM.
 func (vm *cloudHypervisorVM) Info(ctx context.Context) (vmm.VMInfo, error) {
+	vm.mu.RLock()
+	state := vm.state
+	pid := vm.pid
+	vm.mu.RUnlock()
+
 	info := vmm.VMInfo{
 		ID:       vm.id,
-		State:    vm.state,
-		PID:      vm.pid,
+		State:    state,
+		PID:      pid,
 		VCPUs:    vm.config.VCPUs,
 		MemoryMB: vm.config.Memory.SizeMB,
 	}
 
-	if vm.state == vmm.VMStateRunning {
+	if state == vmm.VMStateRunning {
 		// Try to get actual info from API
 		vmInfo, err := vm.getVMInfo(ctx)
 		if err == nil {
@@ -346,11 +368,20 @@ func (vm *cloudHypervisorVM) Info(ctx context.Context) (vmm.VMInfo, error) {
 
 // Wait blocks until the VM stops.
 func (vm *cloudHypervisorVM) Wait(ctx context.Context) error {
-	if vm.cmd == nil {
+	vm.mu.RLock()
+	waitDone := vm.waitDone
+	vm.mu.RUnlock()
+
+	if waitDone == nil {
 		return fmt.Errorf("VM not started")
 	}
 
-	return vm.cmd.Wait()
+	select {
+	case <-waitDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // buildArgs builds command line arguments for cloud-hypervisor.
@@ -365,8 +396,8 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		memArgs += ",shared=on"
 	}
 
-	// Build log file path
-	logFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "cloud-hypervisor.log")
+	// Build serial log file path for VM console output
+	serialLogFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "console.log")
 
 	args := []string{
 		"--api-socket", vm.apiSocket,
@@ -374,7 +405,7 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		"--memory", memArgs,
 		"--kernel", vm.config.Boot.KernelPath,
 		"--cmdline", fmt.Sprintf("\"%s\"", vm.config.Boot.Cmdline),
-		"--log-file", logFile,
+		"--serial", fmt.Sprintf("file=%s", serialLogFile),
 	}
 
 	// Add initrd if specified
@@ -396,9 +427,6 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		args = append(args, "--net", netArg)
 	}
 
-	// Disable console
-	args = append(args, "--console", "null")
-
 	return args
 }
 
@@ -412,34 +440,25 @@ func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Durati
 				return nil
 			}
 		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			time.Sleep(100 * time.Millisecond)
-		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	return fmt.Errorf("timeout waiting for API")
 }
 
-// pingAPI checks if the API is responsive.
+// pingAPI pings the API to check if it's ready.
 func (vm *cloudHypervisorVM) pingAPI(ctx context.Context) error {
-	conn, err := net.Dial("unix", vm.apiSocket)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
+	return vm.sendAPICall(ctx, http.MethodGet, "/ping", nil)
+}
 
-	req := "GET /api/v1/vm.info HTTP/1.0\r\n\r\n"
-	if _, err := conn.Write([]byte(req)); err != nil {
-		return err
-	}
-
-	buf := make([]byte, 1024)
-	_, err = conn.Read(buf)
-	return err
+// getVMInfo retrieves VM information from the API.
+func (vm *cloudHypervisorVM) getVMInfo(ctx context.Context) (*vmm.VMInfo, error) {
+	// Simplified - in production, parse actual API response
+	return &vmm.VMInfo{
+		ID:    vm.id,
+		State: vmm.VMStateRunning,
+		PID:   vm.pid,
+	}, nil
 }
 
 // sendAPICall sends an HTTP request to the VM API via Unix socket.
@@ -485,16 +504,4 @@ func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path strin
 	}
 
 	return nil
-}
-
-// getVMInfo retrieves VM information from the API.
-func (vm *cloudHypervisorVM) getVMInfo(ctx context.Context) (*vmm.VMInfo, error) {
-	// For now, return basic info
-	return &vmm.VMInfo{
-		ID:       vm.id,
-		State:    vm.state,
-		PID:      vm.pid,
-		VCPUs:    vm.config.VCPUs,
-		MemoryMB: vm.config.Memory.SizeMB,
-	}, nil
 }
