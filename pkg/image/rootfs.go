@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/mount"
@@ -80,7 +81,11 @@ func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID s
 	}
 
 	// Prepare snapshot - this creates a new snapshot based on the image layer
-	mounts, err := m.snapshotter.Prepare(ctx, snapshotKey, parentDigest.String())
+	// Add gc.root label to prevent containerd from garbage collecting this snapshot
+	noGcOpt := snapshots.WithLabels(map[string]string{
+		"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339),
+	})
+	mounts, err := m.snapshotter.Prepare(ctx, snapshotKey, parentDigest.String(), noGcOpt)
 	if err != nil {
 		os.RemoveAll(mountPath)
 		return nil, fmt.Errorf("failed to prepare snapshot: %w", err)
