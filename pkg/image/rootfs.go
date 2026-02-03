@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd"
@@ -13,11 +14,24 @@ import (
 	"github.com/containerd/containerd/snapshots"
 )
 
+// ImageCacheEntry represents a cached image mount.
+type ImageCacheEntry struct {
+	ImageRef    string
+	MountPath   string
+	SnapshotKey string
+	KernelPath  string
+	InitrdPath  string
+	RefCount    int
+	mu          sync.RWMutex
+}
+
 // RootFSManager handles creating and managing rootfs from OCI images.
 type RootFSManager struct {
 	client      *Client
 	snapshotter snapshots.Snapshotter
 	dataDir     string
+	imageCache  map[string]*ImageCacheEntry // key: imageRef
+	cacheMu     sync.RWMutex
 }
 
 // RootFS represents a prepared rootfs with kernel and initrd.
@@ -27,6 +41,7 @@ type RootFS struct {
 	SnapshotKey string
 	MountPath   string
 	ImageRef    string
+	cacheEntry  *ImageCacheEntry
 }
 
 // NewRootFSManager creates a new rootfs manager.
@@ -35,12 +50,34 @@ func NewRootFSManager(client *Client, dataDir string) *RootFSManager {
 		client:      client,
 		snapshotter: client.Snapshotter(),
 		dataDir:     dataDir,
+		imageCache:  make(map[string]*ImageCacheEntry),
 	}
 }
 
-// PrepareRootFS pulls an image (if not exists), creates a snapshot, and extracts kernel/initrd paths.
+// PrepareRootFS pulls an image (if not exists), creates a readonly view, and extracts kernel/initrd paths.
+// Multiple sandboxes using the same image will share the same readonly mount.
 func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID string) (*RootFS, error) {
 	ctx = namespaces.WithNamespace(ctx, m.client.namespace)
+
+	// Check cache first
+	m.cacheMu.RLock()
+	if entry, ok := m.imageCache[imageRef]; ok {
+		m.cacheMu.RUnlock()
+		// Increment ref count
+		entry.mu.Lock()
+		entry.RefCount++
+		entry.mu.Unlock()
+
+		return &RootFS{
+			KernelPath:  entry.KernelPath,
+			InitrdPath:  entry.InitrdPath,
+			SnapshotKey: entry.SnapshotKey,
+			MountPath:   entry.MountPath,
+			ImageRef:    imageRef,
+			cacheEntry:  entry,
+		}, nil
+	}
+	m.cacheMu.RUnlock()
 
 	// Try to get image from local first
 	img, err := m.client.GetImage(ctx, imageRef)
@@ -71,31 +108,65 @@ func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID s
 	// This represents the complete filesystem
 	parentDigest := rootfs[len(rootfs)-1]
 
-	// Generate unique snapshot key for this sandbox
-	snapshotKey := fmt.Sprintf("sandbox-%s-rootfs", sandboxID)
+	// Generate snapshot key based on image digest for sharing
+	snapshotKey := fmt.Sprintf("image-%s-view", parentDigest.String())
 
-	// Create mount directory specific to this sandbox
-	mountPath := filepath.Join(m.dataDir, "sandboxes", sandboxID, "rootfs")
+	// Create mount directory based on image digest
+	mountPath := filepath.Join(m.dataDir, "images", parentDigest.String())
+
+	// Check if already mounted by another concurrent call
+	m.cacheMu.Lock()
+	if entry, ok := m.imageCache[imageRef]; ok {
+		m.cacheMu.Unlock()
+		entry.mu.Lock()
+		entry.RefCount++
+		entry.mu.Unlock()
+
+		return &RootFS{
+			KernelPath:  entry.KernelPath,
+			InitrdPath:  entry.InitrdPath,
+			SnapshotKey: entry.SnapshotKey,
+			MountPath:   entry.MountPath,
+			ImageRef:    imageRef,
+			cacheEntry:  entry,
+		}, nil
+	}
+
+	// Create mount directory
 	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		m.cacheMu.Unlock()
 		return nil, fmt.Errorf("failed to create mount directory: %w", err)
 	}
 
-	// Prepare snapshot - this creates a new snapshot based on the image layer
+	// Use View instead of Prepare to create a readonly snapshot
 	// Add gc.root label to prevent containerd from garbage collecting this snapshot
 	noGcOpt := snapshots.WithLabels(map[string]string{
 		"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339),
 	})
-	mounts, err := m.snapshotter.Prepare(ctx, snapshotKey, parentDigest.String(), noGcOpt)
+
+	// Try to use existing view if available
+	mounts, err := m.snapshotter.View(ctx, snapshotKey, parentDigest.String(), noGcOpt)
 	if err != nil {
-		os.RemoveAll(mountPath)
-		return nil, fmt.Errorf("failed to prepare snapshot: %w", err)
+		// View might already exist, try to get mounts
+		mounts, err = m.snapshotter.Mounts(ctx, snapshotKey)
+		if err != nil {
+			os.RemoveAll(mountPath)
+			m.cacheMu.Unlock()
+			return nil, fmt.Errorf("failed to create or get view: %w", err)
+		}
 	}
 
 	// Mount the snapshot
 	if err := mount.All(mounts, mountPath); err != nil {
-		m.snapshotter.Remove(ctx, snapshotKey)
-		os.RemoveAll(mountPath)
-		return nil, fmt.Errorf("failed to mount snapshot: %w", err)
+		// If mount fails, it might already be mounted
+		if _, statErr := os.Stat(filepath.Join(mountPath, "boot")); statErr != nil {
+			// Not mounted, cleanup
+			m.snapshotter.Remove(ctx, snapshotKey)
+			os.RemoveAll(mountPath)
+			m.cacheMu.Unlock()
+			return nil, fmt.Errorf("failed to mount snapshot: %w", err)
+		}
+		// Already mounted, continue
 	}
 
 	// Find kernel and initrd in the mounted rootfs
@@ -104,8 +175,22 @@ func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID s
 		mount.UnmountAll(mountPath, 0)
 		m.snapshotter.Remove(ctx, snapshotKey)
 		os.RemoveAll(mountPath)
+		m.cacheMu.Unlock()
 		return nil, err
 	}
+
+	// Create cache entry
+	entry := &ImageCacheEntry{
+		ImageRef:    imageRef,
+		MountPath:   mountPath,
+		SnapshotKey: snapshotKey,
+		KernelPath:  kernelPath,
+		InitrdPath:  initrdPath,
+		RefCount:    1,
+	}
+
+	m.imageCache[imageRef] = entry
+	m.cacheMu.Unlock()
 
 	return &RootFS{
 		KernelPath:  kernelPath,
@@ -113,6 +198,7 @@ func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID s
 		SnapshotKey: snapshotKey,
 		MountPath:   mountPath,
 		ImageRef:    imageRef,
+		cacheEntry:  entry,
 	}, nil
 }
 
@@ -163,8 +249,22 @@ func (m *RootFSManager) findKernelFiles(mountPath string) (kernelPath, initrdPat
 	return kernelPath, initrdPath, nil
 }
 
-// Cleanup unmounts and removes the rootfs snapshot.
+// Cleanup decreases the ref count and cleans up only when no more references.
 func (r *RootFS) Cleanup(ctx context.Context, snapshotter snapshots.Snapshotter) error {
+	if r.cacheEntry == nil {
+		return nil
+	}
+
+	r.cacheEntry.mu.Lock()
+	r.cacheEntry.RefCount--
+	refCount := r.cacheEntry.RefCount
+	r.cacheEntry.mu.Unlock()
+
+	// Only cleanup when ref count reaches 0
+	if refCount > 0 {
+		return nil
+	}
+
 	// Unmount
 	if err := mount.UnmountAll(r.MountPath, 0); err != nil {
 		fmt.Printf("Warning: failed to unmount %s: %v\n", r.MountPath, err)
