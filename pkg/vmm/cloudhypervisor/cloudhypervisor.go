@@ -307,33 +307,26 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 		return fmt.Errorf("failed to shutdown VM: %w", err)
 	}
 
-	// Wait for process to exit
-	done := make(chan error, 1)
-	go func() {
-		// Try to wait using cmd if available, otherwise just wait and check
-		if vm.cmd != nil {
-			done <- vm.cmd.Wait()
-		} else {
-			// Poll for process exit
-			for {
-				time.Sleep(100 * time.Millisecond)
-				if err := process.Signal(syscall.Signal(0)); err != nil {
-					done <- nil
-					return
-				}
+	// Poll for process exit with timeout
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(30 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			// Force stop if graceful shutdown takes too long
+			return vm.ForceStop(ctx)
+		case <-ticker.C:
+			// Check if process has exited
+			if err := process.Signal(syscall.Signal(0)); err != nil {
+				// Process has exited
+				vm.state = vmm.VMStateStopped
+				return nil
 			}
 		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
-		vm.state = vmm.VMStateStopped
-		return err
-	case <-time.After(30 * time.Second):
-		// Force stop if graceful shutdown takes too long
-		return vm.ForceStop(ctx)
 	}
 }
 
