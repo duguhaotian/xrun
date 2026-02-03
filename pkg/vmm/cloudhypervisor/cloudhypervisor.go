@@ -157,6 +157,7 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
+	defer f.Close()
 
 	// Log detailed configuration and full command
 	vm.logDetailedConfig(f)
@@ -164,43 +165,71 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	fmt.Fprintf(f, "[%s] Starting VM with command: %s\n", time.Now().Format("2006-01-02 15:04:05"), cmdStr)
 	f.Sync()
 
+	// Create stdout/stderr log files separately to avoid race conditions
+	stdoutFile := filepath.Join(vm.driver.dataDir, vm.id, "vm.stdout.log")
+	stderrFile := filepath.Join(vm.driver.dataDir, vm.id, "vm.stderr.log")
+
+	stdoutF, err := os.OpenFile(stdoutFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open stdout log file: %w", err)
+	}
+	defer stdoutF.Close()
+
+	stderrF, err := os.OpenFile(stderrFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open stderr log file: %w", err)
+	}
+	defer stderrF.Close()
+
 	// Create command (don't use CommandContext - we want the VM to keep running)
 	vm.cmd = exec.Command(vm.driver.binaryPath, args...)
-	vm.cmd.Stdout = f
-	vm.cmd.Stderr = f
+	vm.cmd.Stdout = stdoutF
+	vm.cmd.Stderr = stderrF
 
 	// Set up process attributes for proper daemonization
 	vm.cmd.SysProcAttr = &syscall.SysProcAttr{
-		// Don't create a new session - this can cause issues
-		// Instead, just detach from parent's terminal
-		Setpgid: false,
-		Pgid:    0,
+		// Create new session to detach from terminal
+		Setsid: true,
 	}
+
+	fmt.Fprintf(f, "[%s] Executing: %s\n", time.Now().Format("2006-01-02 15:04:05"), vm.driver.binaryPath)
+	fmt.Fprintf(f, "[%s] Args: %v\n", time.Now().Format("2006-01-02 15:04:05"), args)
+	f.Sync()
 
 	if err := vm.cmd.Start(); err != nil {
 		fmt.Fprintf(f, "[%s] Failed to start VM: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
-		f.Close()
 		vm.state = vmm.VMStateFailed
 		return fmt.Errorf("failed to start VM: %w", err)
 	}
 
-	// Don't close file descriptor - keep it open for VM output
-	// f.Close()
-
 	vm.pid = vm.cmd.Process.Pid
 	vm.state = vmm.VMStateRunning
 
+	fmt.Fprintf(f, "[%s] VM started with PID: %d\n", time.Now().Format("2006-01-02 15:04:05"), vm.pid)
+	f.Sync()
+
 	// Start a goroutine to wait for the process to avoid zombie
-	go func() {
-		if err := vm.cmd.Wait(); err != nil {
-			// Process exited with error
-			fmt.Fprintf(f, "[%s] VM process exited with error: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
-		} else {
-			fmt.Fprintf(f, "[%s] VM process exited successfully\n", time.Now().Format("2006-01-02 15:04:05"))
+	// Reopen log file in goroutine to avoid writing to closed file descriptor
+	go func(vmID string, pid int) {
+		// Wait for process to finish
+		waitErr := vm.cmd.Wait()
+
+		// Reopen log file for writing exit status
+		logFile := filepath.Join(vm.driver.dataDir, vmID, "vm.log")
+		logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			defer logF.Close()
+			if waitErr != nil {
+				fmt.Fprintf(logF, "[%s] VM process (PID: %d) exited with error: %v\n", time.Now().Format("2006-01-02 15:04:05"), pid, waitErr)
+			} else {
+				fmt.Fprintf(logF, "[%s] VM process (PID: %d) exited successfully\n", time.Now().Format("2006-01-02 15:04:05"), pid)
+			}
 		}
-		f.Close()
 		vm.state = vmm.VMStateStopped
-	}()
+	}(vm.id, vm.pid)
+
+	// Give the process a moment to start before checking API
+	time.Sleep(500 * time.Millisecond)
 
 	// Wait for API socket to be ready
 	if err := vm.waitForAPI(ctx, 30*time.Second); err != nil {
