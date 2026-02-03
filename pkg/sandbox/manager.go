@@ -396,10 +396,19 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 		}
 	}
 
-	// TODO: Cleanup rootfs snapshot if VM was created with kernel image
-	// Need to track the snapshot key in the VM or sandbox metadata
-
 	delete(m.sandboxes, id)
+
+	// Cleanup rootfs snapshot if exists
+	if meta.SnapshotKey != "" && m.rootFSManager != nil {
+		rootfs := &image.RootFS{
+			SnapshotKey: meta.SnapshotKey,
+			MountPath:   meta.MountPath,
+		}
+		if err := rootfs.Cleanup(ctx, m.rootFSManager.Snapshotter()); err != nil {
+			// Log warning but continue with deletion
+			fmt.Printf("Warning: failed to cleanup rootfs snapshot: %v\n", err)
+		}
+	}
 
 	// Delete metadata from store
 	if err := m.store.Delete(id); err != nil {
