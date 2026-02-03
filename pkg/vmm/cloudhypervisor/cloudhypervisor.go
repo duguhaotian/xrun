@@ -208,11 +208,15 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	fmt.Fprintf(f, "[%s] VM started with PID: %d\n", time.Now().Format("2006-01-02 15:04:05"), vm.pid)
 	f.Sync()
 
+	// Channel to track process exit
+	processDone := make(chan error, 1)
+
 	// Start a goroutine to wait for the process to avoid zombie
 	// Reopen log file in goroutine to avoid writing to closed file descriptor
 	go func(vmID string, pid int) {
 		// Wait for process to finish
 		waitErr := vm.cmd.Wait()
+		processDone <- waitErr
 
 		// Reopen log file for writing exit status
 		logFile := filepath.Join(vm.driver.dataDir, vmID, "vm.log")
@@ -230,6 +234,21 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 
 	// Give the process a moment to start before checking API
 	time.Sleep(500 * time.Millisecond)
+
+	// Check if process exited early
+	select {
+	case waitErr := <-processDone:
+		// Process exited before API was ready
+		vm.state = vmm.VMStateFailed
+		// Read stderr for error details
+		stderrContent, _ := os.ReadFile(stderrFile)
+		if len(stderrContent) > 0 {
+			return fmt.Errorf("VM process exited early: %v, stderr: %s", waitErr, string(stderrContent))
+		}
+		return fmt.Errorf("VM process exited early: %v", waitErr)
+	default:
+		// Process still running, continue to API check
+	}
 
 	// Wait for API socket to be ready
 	if err := vm.waitForAPI(ctx, 30*time.Second); err != nil {
@@ -424,7 +443,7 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		"--cpus", fmt.Sprintf("boot=%d", vm.config.VCPUs),
 		"--memory", memArgs,
 		"--kernel", vm.config.Boot.KernelPath,
-		"--cmdline", vm.config.Boot.Cmdline,
+		"--cmdline", fmt.Sprintf("\"%s\"", vm.config.Boot.Cmdline),
 	}
 
 	// Add initrd if specified
@@ -440,9 +459,6 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		}
 		args = append(args, "--disk", fmt.Sprintf("path=%s%s", vm.config.RootFS.Path, ro))
 	}
-
-	// Add debug logging
-	args = append(args, "--log-level", "debug")
 
 	// Add additional disks (will be vdb, vdc, etc.)
 	for _, disk := range vm.config.Disks {
