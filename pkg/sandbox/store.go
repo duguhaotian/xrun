@@ -22,6 +22,7 @@ type SandboxMeta struct {
 	State       vmm.VMState `json:"state"`
 	SnapshotKey string      `json:"snapshot_key,omitempty"`
 	MountPath   string      `json:"mount_path,omitempty"`
+	Namespace   string      `json:"namespace,omitempty"`
 	CreatedAt   string      `json:"created_at"`
 }
 

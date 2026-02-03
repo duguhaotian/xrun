@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd/namespaces"
 	"github.com/microvm/sandbox/pkg/image"
 	"github.com/microvm/sandbox/pkg/log"
 	"github.com/microvm/sandbox/pkg/vmm"
@@ -136,6 +137,12 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) err
 		return fmt.Errorf("kernel image is required (use --kernel-image)")
 	}
 
+	// Get namespace from rootFSManager
+	namespace := ""
+	if m.rootFSManager != nil {
+		namespace = m.rootFSManager.Namespace()
+	}
+
 	// Save metadata to store
 	meta := &SandboxMeta{
 		ID:          id,
@@ -148,6 +155,7 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) err
 		State:       vmm.VMStatePending,
 		SnapshotKey: bootConfig.SnapshotKey,
 		MountPath:   bootConfig.MountPath,
+		Namespace:   namespace,
 		CreatedAt:   time.Now().Format(time.RFC3339),
 	}
 	if err := m.store.Save(meta); err != nil {
@@ -412,6 +420,11 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 		// Use background context with timeout for cleanup
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+
+		// Set namespace from metadata
+		if meta.Namespace != "" {
+			cleanupCtx = namespaces.WithNamespace(cleanupCtx, meta.Namespace)
+		}
 
 		if err := rootfs.Cleanup(cleanupCtx, m.rootFSManager.Snapshotter()); err != nil {
 			// Log warning but continue with deletion

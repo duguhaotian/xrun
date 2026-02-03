@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -157,6 +158,11 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
 
+	// Log the full command
+	cmdStr := vm.driver.binaryPath + " " + strings.Join(args, " ")
+	fmt.Fprintf(f, "[%s] Starting VM with command: %s\n", time.Now().Format("2006-01-02 15:04:05"), cmdStr)
+	f.Sync()
+
 	// Create command (don't use CommandContext - we want the VM to keep running)
 	vm.cmd = exec.Command(vm.driver.binaryPath, args...)
 	vm.cmd.Stdout = f
@@ -171,13 +177,14 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	}
 
 	if err := vm.cmd.Start(); err != nil {
+		fmt.Fprintf(f, "[%s] Failed to start VM: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
 		f.Close()
 		vm.state = vmm.VMStateFailed
 		return fmt.Errorf("failed to start VM: %w", err)
 	}
 
-	// Close file descriptor in parent process
-	f.Close()
+	// Don't close file descriptor - keep it open for VM output
+	// f.Close()
 
 	vm.pid = vm.cmd.Process.Pid
 	vm.state = vmm.VMStateRunning
@@ -186,7 +193,11 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	go func() {
 		if err := vm.cmd.Wait(); err != nil {
 			// Process exited with error
+			fmt.Fprintf(f, "[%s] VM process exited with error: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
+		} else {
+			fmt.Fprintf(f, "[%s] VM process exited successfully\n", time.Now().Format("2006-01-02 15:04:05"))
 		}
+		f.Close()
 		vm.state = vmm.VMStateStopped
 	}()
 
@@ -430,17 +441,28 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
-	fmt.Printf("Waiting for API socket at %s...\n", vm.apiSocket)
+	logFile := filepath.Join(vm.driver.dataDir, vm.id, "vm.log")
+	f, _ := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if f != nil {
+		defer f.Close()
+		fmt.Fprintf(f, "[%s] Waiting for API socket at %s...\n", time.Now().Format("2006-01-02 15:04:05"), vm.apiSocket)
+	}
 
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(vm.apiSocket); err == nil {
-			fmt.Printf("API socket found, trying to ping...\n")
+			if f != nil {
+				fmt.Fprintf(f, "[%s] API socket found, trying to ping...\n", time.Now().Format("2006-01-02 15:04:05"))
+			}
 			// Try to ping the API
 			if err := vm.pingAPI(ctx); err == nil {
-				fmt.Printf("API is ready\n")
+				if f != nil {
+					fmt.Fprintf(f, "[%s] API is ready\n", time.Now().Format("2006-01-02 15:04:05"))
+				}
 				return nil
 			} else {
-				fmt.Printf("API ping failed: %v\n", err)
+				if f != nil {
+					fmt.Fprintf(f, "[%s] API ping failed: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
+				}
 			}
 		}
 

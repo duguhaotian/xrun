@@ -188,3 +188,8 @@ func (m *RootFSManager) GetImage(ctx context.Context, imageRef string) (containe
 func (m *RootFSManager) Snapshotter() snapshots.Snapshotter {
 	return m.snapshotter
 }
+
+// Namespace returns the containerd namespace.
+func (m *RootFSManager) Namespace() string {
+	return m.client.namespace
+}
