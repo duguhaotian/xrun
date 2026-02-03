@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -302,9 +303,15 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 		return fmt.Errorf("VM process is not running (may have crashed or been killed)")
 	}
 
-	// Send shutdown signal via API
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.shutdown", nil); err != nil {
-		return fmt.Errorf("failed to shutdown VM: %w", err)
+	// Send shutdown signal via API with short timeout
+	// Cloud-Hypervisor may keep connection open until VM exits, so use short timeout
+	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := vm.sendAPICall(shutdownCtx, http.MethodPut, "/vm.shutdown", nil); err != nil {
+		// Ignore timeout errors - VM may be shutting down
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("failed to shutdown VM: %w", err)
+		}
 	}
 
 	// Poll for process exit with timeout
