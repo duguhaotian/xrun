@@ -291,32 +291,43 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 func (s *Server) Stop(ctx context.Context, req *pb.StopRequest) (*pb.StopResponse, error) {
 	log.Info("Stop request: id=%s, force=%v", req.Id, req.Force)
 
+	// First check if sandbox exists and is running
+	meta, err := s.store.Load(req.Id)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox %s not found", req.Id)
+	}
+	if meta.State != vmm.VMStateRunning {
+		return nil, fmt.Errorf("sandbox %s is not running", req.Id)
+	}
+
 	s.mu.Lock()
 	runtime, ok := s.sandboxes[req.Id]
 	s.mu.Unlock()
 
 	if !ok {
-		// Try to load from store
-		meta, err := s.store.Load(req.Id)
-		if err != nil {
-			return nil, fmt.Errorf("sandbox %s not found", req.Id)
+		// Sandbox is marked as running in store but not in runtime cache
+		// This can happen if the daemon was restarted
+		// Just update the state to stopped
+		log.Warn("Sandbox %s is marked as running but not in runtime cache, updating state to stopped", req.Id)
+		if err := s.store.UpdateState(req.Id, vmm.VMStateStopped); err != nil {
+			return nil, fmt.Errorf("failed to update sandbox state: %w", err)
 		}
-		if meta.State != vmm.VMStateRunning {
-			return nil, fmt.Errorf("sandbox %s is not running", req.Id)
-		}
-		return nil, fmt.Errorf("sandbox %s not in runtime cache", req.Id)
+		return &pb.StopResponse{
+			Id:    req.Id,
+			State: string(vmm.VMStateStopped),
+		}, nil
 	}
 
 	// Stop VM
-	var err error
+	var stopErr error
 	if req.Force {
-		err = runtime.VM.ForceStop(ctx)
+		stopErr = runtime.VM.ForceStop(ctx)
 	} else {
-		err = runtime.VM.Stop(ctx)
+		stopErr = runtime.VM.Stop(ctx)
 	}
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to stop VM: %w", err)
+	if stopErr != nil {
+		return nil, fmt.Errorf("failed to stop VM: %w", stopErr)
 	}
 
 	// Update metadata
@@ -378,7 +389,15 @@ func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteR
 
 	// Cleanup VM data directory
 	vmDir := fmt.Sprintf("%s/vms/%s", s.config.DataDir, req.Id)
-	os.RemoveAll(vmDir)
+	if err := os.RemoveAll(vmDir); err != nil {
+		log.Warn("Failed to remove VM directory %s: %v", vmDir, err)
+	}
+
+	// Cleanup snapshots directory
+	snapshotsDir := fmt.Sprintf("%s/snapshots/%s", s.config.DataDir, req.Id)
+	if err := os.RemoveAll(snapshotsDir); err != nil {
+		log.Warn("Failed to remove snapshots directory %s: %v", snapshotsDir, err)
+	}
 
 	return &pb.DeleteResponse{Id: req.Id}, nil
 }
