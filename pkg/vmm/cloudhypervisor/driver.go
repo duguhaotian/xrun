@@ -111,7 +111,13 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		return fmt.Errorf("VM is already running")
 	}
 
-	// Build log file path for cloud-hypervisor
+	// Create VM log directory
+	vmDir := filepath.Join(vm.driver.dataDir, "vms", vm.id)
+	if err := os.MkdirAll(vmDir, 0755); err != nil {
+		return fmt.Errorf("failed to create VM directory: %w", err)
+	}
+
+	// Build args with log-file parameter
 	args := vm.buildArgs()
 
 	// Create command
@@ -359,12 +365,16 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		memArgs += ",shared=on"
 	}
 
+	// Build log file path
+	logFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "cloud-hypervisor.log")
+
 	args := []string{
 		"--api-socket", vm.apiSocket,
 		"--cpus", fmt.Sprintf("boot=%d", vm.config.VCPUs),
 		"--memory", memArgs,
 		"--kernel", vm.config.Boot.KernelPath,
 		"--cmdline", fmt.Sprintf("\"%s\"", vm.config.Boot.Cmdline),
+		"--log-file", logFile,
 	}
 
 	// Add initrd if specified
