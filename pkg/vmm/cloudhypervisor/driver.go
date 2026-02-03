@@ -193,7 +193,8 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 	defer cancel()
 
 	if err := vm.sendAPICall(shutdownCtx, http.MethodPut, "/vm.shutdown", nil); err != nil {
-		return fmt.Errorf("failed to shutdown VM: %w", err)
+		log.Warn("Failed to send shutdown API call, will try force stop: %v", err)
+		return vm.ForceStop(ctx)
 	}
 
 	// Wait for process to exit
@@ -206,9 +207,19 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timeout:
+			log.Warn("VM shutdown timeout after 30s, forcing stop")
 			return vm.ForceStop(ctx)
 		case <-ticker.C:
-			if vm.state != vmm.VMStateRunning {
+			// Check if process has actually exited
+			if vm.cmd != nil && vm.cmd.Process != nil {
+				if err := vm.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+					// Process has exited
+					vm.state = vmm.VMStateStopped
+					return nil
+				}
+			} else {
+				// No process, consider stopped
+				vm.state = vmm.VMStateStopped
 				return nil
 			}
 		}
