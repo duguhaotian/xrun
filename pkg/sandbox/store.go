@@ -20,6 +20,7 @@ type SandboxMeta struct {
 	RootFS      string      `json:"rootfs,omitempty"`
 	Cmdline     string      `json:"cmdline"`
 	State       vmm.VMState `json:"state"`
+	PID         int         `json:"pid,omitempty"`
 	SnapshotKey string      `json:"snapshot_key,omitempty"`
 	MountPath   string      `json:"mount_path,omitempty"`
 	Namespace   string      `json:"namespace,omitempty"`
@@ -144,6 +145,46 @@ func (s *Store) UpdateState(id string, state vmm.VMState) error {
 	}
 
 	meta.State = state
+
+	// Save directly without calling Save() to avoid lock reentrancy
+	sandboxDir := filepath.Join(s.dataDir, "sandboxes", meta.ID)
+	if err := os.MkdirAll(sandboxDir, 0755); err != nil {
+		return fmt.Errorf("failed to create sandbox directory: %w", err)
+	}
+
+	data, err = json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	if err := os.WriteFile(metaPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write metadata file: %w", err)
+	}
+
+	return nil
+}
+
+// UpdatePID updates the sandbox PID in storage.
+func (s *Store) UpdatePID(id string, pid int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Load metadata directly without calling Load() to avoid lock reentrancy
+	metaPath := filepath.Join(s.dataDir, "sandboxes", id, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("sandbox %s not found", id)
+		}
+		return fmt.Errorf("failed to read metadata file: %w", err)
+	}
+
+	var meta SandboxMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return fmt.Errorf("failed to unmarshal metadata: %w", err)
+	}
+
+	meta.PID = pid
 
 	// Save directly without calling Save() to avoid lock reentrancy
 	sandboxDir := filepath.Join(s.dataDir, "sandboxes", meta.ID)

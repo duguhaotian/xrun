@@ -141,6 +141,11 @@ func (vm *cloudHypervisorVM) SetState(state vmm.VMState) {
 	vm.state = state
 }
 
+// SetPID sets the VM PID (used when loading from storage).
+func (vm *cloudHypervisorVM) SetPID(pid int) {
+	vm.pid = pid
+}
+
 // Start starts the VM.
 func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	if vm.state == vmm.VMStateRunning {
@@ -271,14 +276,27 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 		return fmt.Errorf("VM is not running (current state: %s)", vm.state)
 	}
 
-	// Double-check if the process is actually alive
-	if vm.cmd == nil || vm.cmd.Process == nil {
+	// Try to find the process by PID
+	var process *os.Process
+	var err error
+
+	if vm.cmd != nil && vm.cmd.Process != nil {
+		// Use the process from cmd if available (same session)
+		process = vm.cmd.Process
+	} else if vm.pid > 0 {
+		// Try to find process by PID (loaded from storage)
+		process, err = os.FindProcess(vm.pid)
+		if err != nil {
+			vm.state = vmm.VMStateStopped
+			return fmt.Errorf("VM process with PID %d not found: %w", vm.pid, err)
+		}
+	} else {
 		vm.state = vmm.VMStateStopped
-		return fmt.Errorf("VM process is not running")
+		return fmt.Errorf("VM process information not available")
 	}
 
 	// Check if process is still alive
-	if err := vm.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+	if err := process.Signal(syscall.Signal(0)); err != nil {
 		// Process is not running, update state
 		vm.state = vmm.VMStateStopped
 		return fmt.Errorf("VM process is not running (may have crashed or been killed)")
@@ -292,7 +310,19 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 	// Wait for process to exit
 	done := make(chan error, 1)
 	go func() {
-		done <- vm.cmd.Wait()
+		// Try to wait using cmd if available, otherwise just wait and check
+		if vm.cmd != nil {
+			done <- vm.cmd.Wait()
+		} else {
+			// Poll for process exit
+			for {
+				time.Sleep(100 * time.Millisecond)
+				if err := process.Signal(syscall.Signal(0)); err != nil {
+					done <- nil
+					return
+				}
+			}
+		}
 	}()
 
 	select {
@@ -309,13 +339,29 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 
 // ForceStop forcefully stops the VM.
 func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
-	if vm.cmd == nil || vm.cmd.Process == nil {
+	// Try to find the process by PID
+	var process *os.Process
+	var err error
+
+	if vm.cmd != nil && vm.cmd.Process != nil {
+		// Use the process from cmd if available (same session)
+		process = vm.cmd.Process
+	} else if vm.pid > 0 {
+		// Try to find process by PID (loaded from storage)
+		process, err = os.FindProcess(vm.pid)
+		if err != nil {
+			// Process not found, assume already stopped
+			vm.state = vmm.VMStateStopped
+			return nil
+		}
+	} else {
+		// No process information available
 		vm.state = vmm.VMStateStopped
 		return nil
 	}
 
 	// Try graceful termination first
-	if err := vm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := process.Signal(syscall.SIGTERM); err != nil {
 		// Process might already be dead
 		vm.state = vmm.VMStateStopped
 		return nil
@@ -325,7 +371,7 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 	time.Sleep(2 * time.Second)
 
 	// Force kill if still running
-	_ = vm.cmd.Process.Kill()
+	_ = process.Kill()
 
 	vm.state = vmm.VMStateStopped
 	return nil
@@ -405,11 +451,26 @@ func (vm *cloudHypervisorVM) Restore(ctx context.Context, config vmm.RestoreConf
 // Info returns current VM information.
 func (vm *cloudHypervisorVM) Info(ctx context.Context) (vmm.VMInfo, error) {
 	// Check if the VM process is actually running
-	if vm.state == vmm.VMStateRunning && vm.cmd != nil && vm.cmd.Process != nil {
-		// Check if process is still alive
-		if err := vm.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-			// Process is not running, update state
-			vm.state = vmm.VMStateStopped
+	if vm.state == vmm.VMStateRunning {
+		var process *os.Process
+		var err error
+
+		if vm.cmd != nil && vm.cmd.Process != nil {
+			process = vm.cmd.Process
+		} else if vm.pid > 0 {
+			process, err = os.FindProcess(vm.pid)
+			if err != nil {
+				// Process not found, update state
+				vm.state = vmm.VMStateStopped
+			}
+		}
+
+		if process != nil {
+			// Check if process is still alive
+			if err := process.Signal(syscall.Signal(0)); err != nil {
+				// Process is not running, update state
+				vm.state = vmm.VMStateStopped
+			}
 		}
 	}
 

@@ -273,6 +273,13 @@ func (m *Manager) loadVMUnlocked(ctx context.Context, id string) (vmm.VM, error)
 		info.SetState(meta.State)
 	}
 
+	// Sync PID from storage to VM instance
+	if meta.PID > 0 {
+		if info, ok := vm.(interface{ SetPID(int) }); ok {
+			info.SetPID(meta.PID)
+		}
+	}
+
 	// Save to memory
 	m.sandboxes[id] = vm
 
@@ -316,6 +323,11 @@ func (m *Manager) UpdateSandboxState(id string, state vmm.VMState) error {
 	return m.store.UpdateState(id, state)
 }
 
+// UpdateSandboxPID updates the PID of a sandbox in storage.
+func (m *Manager) UpdateSandboxPID(id string, pid int) error {
+	return m.store.UpdatePID(id, pid)
+}
+
 // Stop stops a sandbox gracefully.
 func (m *Manager) Stop(ctx context.Context, id string, force bool) error {
 	vm, err := m.Get(ctx, id)
@@ -334,6 +346,13 @@ func (m *Manager) Stop(ctx context.Context, id string, force bool) error {
 		return fmt.Errorf("sandbox %s is not running (current state: %s)", id, meta.State)
 	}
 
+	// Pass PID to VM for process management
+	if meta.PID > 0 {
+		if info, ok := vm.(interface{ SetPID(int) }); ok {
+			info.SetPID(meta.PID)
+		}
+	}
+
 	if force {
 		return vm.ForceStop(ctx)
 	}
@@ -348,6 +367,19 @@ func (m *Manager) Pause(ctx context.Context, id string) error {
 		return err
 	}
 
+	// Load metadata to get PID
+	meta, err := m.store.Load(id)
+	if err != nil {
+		return err
+	}
+
+	// Pass PID to VM for process management
+	if meta.PID > 0 {
+		if info, ok := vm.(interface{ SetPID(int) }); ok {
+			info.SetPID(meta.PID)
+		}
+	}
+
 	return vm.Pause(ctx)
 }
 
@@ -356,6 +388,19 @@ func (m *Manager) Resume(ctx context.Context, id string) error {
 	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
+	}
+
+	// Load metadata to get PID
+	meta, err := m.store.Load(id)
+	if err != nil {
+		return err
+	}
+
+	// Pass PID to VM for process management
+	if meta.PID > 0 {
+		if info, ok := vm.(interface{ SetPID(int) }); ok {
+			info.SetPID(meta.PID)
+		}
 	}
 
 	return vm.Resume(ctx)
@@ -372,6 +417,19 @@ func (m *Manager) Snapshot(ctx context.Context, id string, opts SnapshotOptions)
 	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
+	}
+
+	// Load metadata to get PID
+	meta, err := m.store.Load(id)
+	if err != nil {
+		return err
+	}
+
+	// Pass PID to VM for process management
+	if meta.PID > 0 {
+		if info, ok := vm.(interface{ SetPID(int) }); ok {
+			info.SetPID(meta.PID)
+		}
 	}
 
 	config := vmm.SnapshotConfig{
@@ -392,6 +450,19 @@ func (m *Manager) Restore(ctx context.Context, id string, opts RestoreOptions) e
 	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
+	}
+
+	// Load metadata to get PID
+	meta, err := m.store.Load(id)
+	if err != nil {
+		return err
+	}
+
+	// Pass PID to VM for process management
+	if meta.PID > 0 {
+		if info, ok := vm.(interface{ SetPID(int) }); ok {
+			info.SetPID(meta.PID)
+		}
 	}
 
 	config := vmm.RestoreConfig{
@@ -415,6 +486,12 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 	// Try to get VM from memory
 	vm, ok := m.sandboxes[id]
 	if ok {
+		// Pass PID to VM for process management
+		if meta.PID > 0 {
+			if info, ok := vm.(interface{ SetPID(int) }); ok {
+				info.SetPID(meta.PID)
+			}
+		}
 		// Check if VM is running and stop if needed
 		info, err := vm.Info(ctx)
 		if err == nil && info.State == vmm.VMStateRunning {
@@ -433,6 +510,12 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 		}
 		// Try to load and stop (use unlocked version since we already hold the lock)
 		if loadedVM, err := m.loadVMUnlocked(ctx, id); err == nil {
+			// Pass PID to loaded VM
+			if meta.PID > 0 {
+				if info, ok := loadedVM.(interface{ SetPID(int) }); ok {
+					info.SetPID(meta.PID)
+				}
+			}
 			_ = loadedVM.ForceStop(ctx)
 		}
 	}
@@ -480,6 +563,19 @@ func (m *Manager) Wait(ctx context.Context, id string) error {
 	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
+	}
+
+	// Load metadata to get PID
+	meta, err := m.store.Load(id)
+	if err != nil {
+		return err
+	}
+
+	// Pass PID to VM for process management
+	if meta.PID > 0 {
+		if info, ok := vm.(interface{ SetPID(int) }); ok {
+			info.SetPID(meta.PID)
+		}
 	}
 
 	return vm.Wait(ctx)

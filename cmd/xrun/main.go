@@ -253,6 +253,15 @@ func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) e
 		fmt.Printf("Warning: failed to update sandbox state: %v\n", err)
 	}
 
+	// Get PID from VM and save to storage
+	if info, err := vm.Info(ctx); err == nil {
+		if info.PID > 0 {
+			if err := manager.UpdateSandboxPID(id, info.PID); err != nil {
+				fmt.Printf("Warning: failed to update sandbox PID: %v\n", err)
+			}
+		}
+	}
+
 	log.Info("Successfully started sandbox %s", id)
 	fmt.Printf("Started sandbox %s\n", id)
 	return nil
