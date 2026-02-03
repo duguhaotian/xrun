@@ -2,27 +2,55 @@
 # See AGENTS.md for detailed project guidelines
 
 # Variables
-BINARY_NAME := xrun
-BINARY_PATH := bin/$(BINARY_NAME)
 GO := go
 GOPATH := $(shell $(GO) env GOPATH)
 LDFLAGS := -ldflags="-s -w"
+BIN_DIR := bin
+CMD_DIR := cmd
+
+# Auto-detect all binaries from cmd/ directory
+CMD_PACKAGES := $(wildcard $(CMD_DIR)/*)
+BINARIES := $(notdir $(CMD_PACKAGES))
+BINARY_PATHS := $(addprefix $(BIN_DIR)/,$(BINARIES))
 
 # Default target
 .PHONY: all
 all: build
 
-# Build targets
+# Build all binaries
 .PHONY: build
-build: ## Build the CLI binary
-	@mkdir -p bin
-	$(GO) build -o $(BINARY_PATH) ./cmd/xrun
+build: $(BINARY_PATHS) ## Build all binaries from cmd/*
 
+# Pattern rule to build each binary
+$(BIN_DIR)/%: $(CMD_DIR)/%/main.go $(CMD_DIR)/%/*.go
+	@mkdir -p $(BIN_DIR)
+	$(GO) build -o $@ ./$(CMD_DIR)/$*
+
+# Build production binaries (stripped)
 .PHONY: build-prod
-build-prod: ## Build production binary (stripped)
-	@mkdir -p bin
-	$(GO) build $(LDFLAGS) -o $(BINARY_PATH) ./cmd/xrun
+build-prod: ## Build production binaries (stripped)
+	@mkdir -p $(BIN_DIR)
+	@for binary in $(BINARIES); do \
+		echo "Building $$binary (production)..."; \
+		$(GO) build $(LDFLAGS) -o $(BIN_DIR)/$$binary ./$(CMD_DIR)/$$binary; \
+	done
 
+# Generate build and run targets for each binary
+define BUILD_RULE
+.PHONY: build-$(1)
+build-$(1): $(BIN_DIR)/$(1) ## Build $(1) binary
+endef
+
+define RUN_RULE
+.PHONY: run-$(1)
+run-$(1): $(BIN_DIR)/$(1) ## Build and run $(1) binary
+	./$(BIN_DIR)/$(1)
+endef
+
+$(foreach binary,$(BINARIES),$(eval $(call BUILD_RULE,$(binary))))
+$(foreach binary,$(BINARIES),$(eval $(call RUN_RULE,$(binary))))
+
+# Build all packages
 .PHONY: build-all
 build-all: ## Build all packages
 	$(GO) build ./...
@@ -87,13 +115,9 @@ imports: ## Check and fix imports (requires goimports)
 	fi
 
 # Development targets
-.PHONY: run
-run: build ## Build and run the CLI
-	./$(BINARY_PATH)
-
 .PHONY: clean
 clean: ## Clean build artifacts
-	@rm -rf bin/
+	@rm -rf $(BIN_DIR)/
 	@rm -f coverage.out
 
 .PHONY: deps
@@ -118,4 +142,11 @@ ci: lint-full test-race build-all ## Run CI pipeline (lint + race tests + build)
 .PHONY: help
 help: ## Show this help message
 	@echo "Available targets:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "Detected binaries: $(BINARIES)"
+	@echo ""
+	@echo "Dynamic targets:"
+	@echo "  $(BIN_DIR)/<name>    Build specific binary"
+	@echo "  build-<name>         Build specific binary (alias)"
+	@echo "  run-<name>           Build and run specific binary"
