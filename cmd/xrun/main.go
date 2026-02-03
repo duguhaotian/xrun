@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/microvm/sandbox/pkg/log"
 	"github.com/microvm/sandbox/pkg/sandbox"
 	"github.com/microvm/sandbox/pkg/vmm"
 	"github.com/microvm/sandbox/pkg/vmm/cloudhypervisor"
@@ -35,8 +36,15 @@ func main() {
 }
 
 func run() error {
+	// Initialize logging
+	if err := log.Init("/var/log/xrun"); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to initialize logging: %v\n", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	log.Info("Starting xrun...")
 
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
@@ -145,6 +153,8 @@ Examples:
 }
 
 func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	log.Info("Creating sandbox with args: %v", args)
+
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 
 	var flags CreateFlags
@@ -170,6 +180,8 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 	if flags.Image == "" {
 		return fmt.Errorf("-image is required")
 	}
+
+	log.Info("Creating sandbox %s with image %s", flags.ID, flags.Image)
 
 	// Build options
 	opts := sandbox.CreateOptions{
@@ -197,14 +209,18 @@ func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) 
 	}
 
 	if err := manager.Create(ctx, flags.ID, opts); err != nil {
+		log.Error("Failed to create sandbox %s: %v", flags.ID, err)
 		return err
 	}
 
+	log.Info("Successfully created sandbox %s", flags.ID)
 	fmt.Printf("Created sandbox %s\n", flags.ID)
 	return nil
 }
 
 func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) error {
+	log.Info("Starting sandbox with args: %v", args)
+
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	var id string
 	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
@@ -217,12 +233,18 @@ func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) e
 		return fmt.Errorf("-id is required")
 	}
 
+	log.Info("Loading VM for sandbox %s", id)
+
 	vm, err := manager.Get(ctx, id)
 	if err != nil {
+		log.Error("Failed to get sandbox %s: %v", id, err)
 		return fmt.Errorf("failed to load sandbox %s: %w", id, err)
 	}
 
+	log.Info("Starting VM for sandbox %s", id)
+
 	if err := vm.Start(ctx); err != nil {
+		log.Error("Failed to start VM for sandbox %s: %v", id, err)
 		return err
 	}
 
@@ -231,6 +253,7 @@ func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) e
 		fmt.Printf("Warning: failed to update sandbox state: %v\n", err)
 	}
 
+	log.Info("Successfully started sandbox %s", id)
 	fmt.Printf("Started sandbox %s\n", id)
 	return nil
 }

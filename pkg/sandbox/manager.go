@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/microvm/sandbox/pkg/image"
+	"github.com/microvm/sandbox/pkg/log"
 	"github.com/microvm/sandbox/pkg/vmm"
 )
 
@@ -88,6 +89,8 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	log.Info("Creating sandbox %s with image %s", id, opts.Image)
+
 	// Use default VMM if not specified
 	vmmName := opts.VMM
 	if vmmName == "" {
@@ -164,6 +167,8 @@ func (m *Manager) Get(ctx context.Context, id string) (vmm.VM, error) {
 func (m *Manager) LoadVM(ctx context.Context, id string) (vmm.VM, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	log.Info("Loading VM for sandbox %s from metadata", id)
 
 	// Check if already loaded
 	if vm, ok := m.sandboxes[id]; ok {

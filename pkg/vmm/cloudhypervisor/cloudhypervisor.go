@@ -151,15 +151,14 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
+	defer f.Close()
 
-	vm.cmd = exec.CommandContext(ctx, vm.driver.binaryPath, args...)
+	vm.cmd = exec.Command(vm.driver.binaryPath, args...)
 	vm.cmd.Stdout = f
 	vm.cmd.Stderr = f
 
-	// Set process to run in new process group (background)
-	vm.cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	// Don't set Setpgid - it causes issues with some VMMs
+	// The process will still run in background because we don't wait for it
 
 	if err := vm.cmd.Start(); err != nil {
 		vm.state = vmm.VMStateFailed
@@ -210,22 +209,17 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 // ForceStop forcefully stops the VM.
 func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 	if vm.cmd != nil && vm.cmd.Process != nil {
-		// Kill the entire process group to ensure all child processes are terminated
-		pgid, err := syscall.Getpgid(vm.cmd.Process.Pid)
-		if err == nil {
-			// Send SIGTERM to the process group
-			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		// Try graceful termination first
+		if err := vm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			// Process might already be dead
+			vm.state = vmm.VMStateStopped
+			return nil
 		}
 
 		// Give it a moment to terminate gracefully
 		time.Sleep(2 * time.Second)
 
-		// Force kill the process group if still running
-		if pgid > 0 {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		}
-
-		// Also kill the main process directly as fallback
+		// Force kill if still running
 		_ = vm.cmd.Process.Kill()
 	}
 
