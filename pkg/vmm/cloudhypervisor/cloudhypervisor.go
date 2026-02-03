@@ -158,7 +158,8 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
 
-	// Log the full command
+	// Log detailed configuration and full command
+	vm.logDetailedConfig(f)
 	cmdStr := vm.driver.binaryPath + " " + strings.Join(args, " ")
 	fmt.Fprintf(f, "[%s] Starting VM with command: %s\n", time.Now().Format("2006-01-02 15:04:05"), cmdStr)
 	f.Sync()
@@ -435,6 +436,43 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 	args = append(args, "--console", "null")
 
 	return args
+}
+
+// logDetailedConfig logs detailed VM configuration to the log file.
+func (vm *cloudHypervisorVM) logDetailedConfig(f *os.File) {
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+
+	fmt.Fprintf(f, "[%s] ========== VM Configuration ==========\n", timestamp)
+	fmt.Fprintf(f, "[%s] VM ID: %s\n", timestamp, vm.id)
+	fmt.Fprintf(f, "[%s] API Socket: %s\n", timestamp, vm.apiSocket)
+	fmt.Fprintf(f, "[%s] VCPUs: %d\n", timestamp, vm.config.VCPUs)
+	fmt.Fprintf(f, "[%s] Memory: %d MB\n", timestamp, vm.config.Memory.SizeMB)
+	fmt.Fprintf(f, "[%s] Memory Backend: %s\n", timestamp, vm.config.Memory.Backend)
+	if vm.config.Memory.BackendPath != "" {
+		fmt.Fprintf(f, "[%s] Memory Backend Path: %s\n", timestamp, vm.config.Memory.BackendPath)
+	}
+	fmt.Fprintf(f, "[%s] Kernel Path: %s\n", timestamp, vm.config.Boot.KernelPath)
+	if vm.config.Boot.InitrdPath != "" {
+		fmt.Fprintf(f, "[%s] Initrd Path: %s\n", timestamp, vm.config.Boot.InitrdPath)
+	}
+	fmt.Fprintf(f, "[%s] Kernel Cmdline: %s\n", timestamp, vm.config.Boot.Cmdline)
+	if vm.config.RootFS.Path != "" {
+		fmt.Fprintf(f, "[%s] RootFS Path: %s\n", timestamp, vm.config.RootFS.Path)
+		fmt.Fprintf(f, "[%s] RootFS ReadOnly: %v\n", timestamp, vm.config.RootFS.ReadOnly)
+	}
+	if len(vm.config.Disks) > 0 {
+		fmt.Fprintf(f, "[%s] Additional Disks:\n", timestamp)
+		for i, disk := range vm.config.Disks {
+			fmt.Fprintf(f, "[%s]   Disk %d: path=%s, readonly=%v\n", timestamp, i, disk.Path, disk.ReadOnly)
+		}
+	}
+	if vm.config.Network.TapDevice != "" {
+		fmt.Fprintf(f, "[%s] Network:\n", timestamp)
+		fmt.Fprintf(f, "[%s]   Tap Device: %s\n", timestamp, vm.config.Network.TapDevice)
+		fmt.Fprintf(f, "[%s]   MAC Address: %s\n", timestamp, vm.config.Network.MACAddr)
+		fmt.Fprintf(f, "[%s]   IP Address: %s\n", timestamp, vm.config.Network.IPAddr)
+	}
+	fmt.Fprintf(f, "[%s] ======================================\n", timestamp)
 }
 
 // waitForAPI waits for the API socket to become available.

@@ -137,10 +137,13 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) err
 		return fmt.Errorf("kernel image is required (use --kernel-image)")
 	}
 
-	// Get namespace from rootFSManager
-	namespace := ""
+	// Get namespace from rootFSManager, default to "default" if not set
+	namespace := "default"
 	if m.rootFSManager != nil {
-		namespace = m.rootFSManager.Namespace()
+		ns := m.rootFSManager.Namespace()
+		if ns != "" {
+			namespace = ns
+		}
 	}
 
 	// Save metadata to store
