@@ -507,19 +507,16 @@ func (vm *cloudHypervisorVM) logDetailedConfig(f *os.File) {
 // waitForAPI waits for the API socket to become available.
 func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var lastErr error
 
 	logFile := filepath.Join(vm.driver.dataDir, vm.id, "vm.log")
 	f, _ := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if f != nil {
 		defer f.Close()
-		fmt.Fprintf(f, "[%s] Waiting for API socket at %s...\n", time.Now().Format("2006-01-02 15:04:05"), vm.apiSocket)
 	}
 
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(vm.apiSocket); err == nil {
-			if f != nil {
-				fmt.Fprintf(f, "[%s] API socket found, trying to ping...\n", time.Now().Format("2006-01-02 15:04:05"))
-			}
 			// Try to ping the API
 			if err := vm.pingAPI(ctx); err == nil {
 				if f != nil {
@@ -527,9 +524,7 @@ func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Durati
 				}
 				return nil
 			} else {
-				if f != nil {
-					fmt.Fprintf(f, "[%s] API ping failed: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
-				}
+				lastErr = err
 			}
 		}
 
@@ -541,6 +536,10 @@ func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Durati
 		}
 	}
 
+	if f != nil {
+		fmt.Fprintf(f, "[%s] Timeout waiting for API at %s (PID: %d), last error: %v\n",
+			time.Now().Format("2006-01-02 15:04:05"), vm.apiSocket, vm.pid, lastErr)
+	}
 	return fmt.Errorf("timeout waiting for API at %s (PID: %d)", vm.apiSocket, vm.pid)
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,6 +126,19 @@ func (m *Manager) Create(ctx context.Context, id string, opts CreateOptions) err
 			SnapshotKey: rootfs.SnapshotKey,
 			MountPath:   rootfs.MountPath,
 		}
+
+		// Build cmdline: use provided cmdline or default, add root= if rootfs specified
+		cmdline := opts.Boot.Cmdline
+		if cmdline == "" {
+			cmdline = "console=hvc0 rw"
+		}
+		if opts.RootFS.Path != "" {
+			// Add root=/dev/vda if not already present
+			if !strings.Contains(cmdline, "root=") {
+				cmdline = cmdline + " root=/dev/vda"
+			}
+		}
+		bootConfig.Cmdline = cmdline
 
 		// If no rootfs disk specified, we can use the snapshot mount as the rootfs
 		// This requires the VMM to support mounting a directory as a disk
@@ -438,6 +452,13 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 	// Delete metadata from store
 	if err := m.store.Delete(id); err != nil {
 		return fmt.Errorf("failed to delete sandbox metadata: %w", err)
+	}
+
+	// Cleanup VM data directory
+	vmDataDir := filepath.Join(m.dataDir, "vms", id)
+	if err := os.RemoveAll(vmDataDir); err != nil {
+		// Log warning but don't fail deletion
+		fmt.Printf("Warning: failed to remove VM data directory %s: %v\n", vmDataDir, err)
 	}
 
 	return nil
