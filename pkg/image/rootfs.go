@@ -59,7 +59,7 @@ func NewRootFSManager(client *Client, dataDir string) *RootFSManager {
 func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID string) (*RootFS, error) {
 	ctx = namespaces.WithNamespace(ctx, m.client.namespace)
 
-	// Check cache first
+	// Check memory cache first
 	m.cacheMu.RLock()
 	if entry, ok := m.imageCache[imageRef]; ok {
 		m.cacheMu.RUnlock()
@@ -114,7 +114,7 @@ func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID s
 	// Create mount directory based on image digest
 	mountPath := filepath.Join(m.dataDir, "images", parentDigest.String())
 
-	// Check if already mounted by another concurrent call
+	// Check memory cache again for concurrent calls
 	m.cacheMu.Lock()
 	if entry, ok := m.imageCache[imageRef]; ok {
 		m.cacheMu.Unlock()
@@ -127,6 +127,31 @@ func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID s
 			InitrdPath:  entry.InitrdPath,
 			SnapshotKey: entry.SnapshotKey,
 			MountPath:   entry.MountPath,
+			ImageRef:    imageRef,
+			cacheEntry:  entry,
+		}, nil
+	}
+
+	// Check if already mounted on disk (from previous process run)
+	if kernelPath, initrdPath, err := m.checkExistingMount(mountPath); err == nil {
+		// Found existing mount, create cache entry and reuse
+		entry := &ImageCacheEntry{
+			ImageRef:    imageRef,
+			MountPath:   mountPath,
+			SnapshotKey: snapshotKey,
+			KernelPath:  kernelPath,
+			InitrdPath:  initrdPath,
+			RefCount:    1,
+		}
+
+		m.imageCache[imageRef] = entry
+		m.cacheMu.Unlock()
+
+		return &RootFS{
+			KernelPath:  kernelPath,
+			InitrdPath:  initrdPath,
+			SnapshotKey: snapshotKey,
+			MountPath:   mountPath,
 			ImageRef:    imageRef,
 			cacheEntry:  entry,
 		}, nil
@@ -200,6 +225,29 @@ func (m *RootFSManager) PrepareRootFS(ctx context.Context, imageRef, sandboxID s
 		ImageRef:    imageRef,
 		cacheEntry:  entry,
 	}, nil
+}
+
+// checkExistingMount checks if the mount path already has a valid mount with kernel files.
+// This handles the case where cache is lost (e.g., process restart) but mount still exists.
+func (m *RootFSManager) checkExistingMount(mountPath string) (kernelPath, initrdPath string, err error) {
+	// Check if mount path exists
+	if _, err := os.Stat(mountPath); err != nil {
+		return "", "", fmt.Errorf("mount path does not exist: %w", err)
+	}
+
+	// Check if it's actually mounted by looking for boot directory
+	bootDir := filepath.Join(mountPath, "boot")
+	if _, err := os.Stat(bootDir); err != nil {
+		return "", "", fmt.Errorf("boot directory not found, may not be mounted: %w", err)
+	}
+
+	// Try to find kernel files
+	kernelPath, initrdPath, err = m.findKernelFiles(mountPath)
+	if err != nil {
+		return "", "", fmt.Errorf("kernel files not found in existing mount: %w", err)
+	}
+
+	return kernelPath, initrdPath, nil
 }
 
 // findKernelFiles searches for kernel and initrd in the mounted rootfs.

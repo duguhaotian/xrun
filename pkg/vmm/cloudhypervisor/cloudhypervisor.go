@@ -673,24 +673,54 @@ func (vm *cloudHypervisorVM) pingAPI(ctx context.Context) error {
 	return nil
 }
 
-// sendAPICall sends an HTTP request to the VM API.
+// sendAPICall sends an HTTP request to the VM API via Unix socket.
 func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path string, body interface{}) error {
 	var bodyReader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to marshal request body: %w", err)
 		}
 		bodyReader = bytes.NewReader(data)
 	}
 
-	// For now, this is a placeholder - actual Unix socket HTTP client implementation needed
-	// In production, you'd use a proper Unix socket HTTP client
-	_ = method
-	_ = path
-	_ = bodyReader
+	// Build full URL path
+	url := fmt.Sprintf("http://localhost/api/%s%s", apiVersion, path)
 
-	return fmt.Errorf("API calls not fully implemented - requires Unix socket HTTP client")
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Create Unix socket HTTP client
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("unix", vm.apiSocket)
+			},
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send API request to %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API request to %s failed with status %d: %s", path, resp.StatusCode, string(bodyBytes))
+	}
+
+	return nil
 }
 
 // getVMInfo retrieves VM information from the API.
