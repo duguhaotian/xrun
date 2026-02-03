@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+package xrun;
+
+option go_package = "github.com/microvm/sandbox/api/proto";
+
+// SandboxService provides lifecycle management for microVM sandboxes
+service SandboxService {
+  // Run creates and starts a new sandbox
+  rpc Run(RunRequest) returns (RunResponse);
+  
+  // Stop stops a running sandbox
+  rpc Stop(StopRequest) returns (StopResponse);
+  
+  // Delete removes a sandbox
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  
+  // Get returns information about a sandbox
+  rpc Get(GetRequest) returns (GetResponse);
+  
+  // List returns all sandboxes
+  rpc List(ListRequest) returns (ListResponse);
+  
+  // Snapshot creates a snapshot of a sandbox
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  
+  // Restore restores a sandbox from a snapshot
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+}
+
+// RunRequest contains parameters for creating and starting a sandbox
+message RunRequest {
+  string id = 1;
+  string image = 2;              // OCI image reference containing kernel and initrd
+  string rootfs = 3;             // Path to VM rootfs disk image
+  uint32 vcpus = 4;              // Number of vCPUs
+  uint32 memory_mb = 5;          // Memory size in MB
+  string cmdline = 6;            // Kernel command line
+  map<string, string> labels = 7; // Additional labels
+}
+
+// RunResponse contains the result of a Run operation
+message RunResponse {
+  string id = 1;
+  string state = 2;
+  int32 pid = 3;
+  string ip_address = 4;         // veth host IP (empty if network disabled)
+}
+
+// StopRequest contains parameters for stopping a sandbox
+message StopRequest {
+  string id = 1;
+  bool force = 2;                // Force stop if true
+}
+
+// StopResponse contains the result of a Stop operation
+message StopResponse {
+  string id = 1;
+  string state = 2;
+}
+
+// DeleteRequest contains parameters for deleting a sandbox
+message DeleteRequest {
+  string id = 1;
+  bool force = 2;                // Force delete if running
+}
+
+// DeleteResponse contains the result of a Delete operation
+message DeleteResponse {
+  string id = 1;
+}
+
+// GetRequest contains parameters for getting sandbox info
+message GetRequest {
+  string id = 1;
+}
+
+// GetResponse contains sandbox information
+message GetResponse {
+  Sandbox sandbox = 1;
+}
+
+// ListRequest contains parameters for listing sandboxes
+message ListRequest {
+  map<string, string> filters = 1; // Optional filters
+}
+
+// ListResponse contains a list of sandboxes
+message ListResponse {
+  repeated Sandbox sandboxes = 1;
+}
+
+// Sandbox represents a microVM sandbox
+message Sandbox {
+  string id = 1;
+  string state = 2;
+  int32 pid = 3;
+  uint32 vcpus = 4;
+  uint32 memory_mb = 5;
+  string image = 6;
+  string rootfs = 7;
+  string ip_address = 8;
+  string created_at = 9;
+  map<string, string> labels = 10;
+}
+
+// SnapshotRequest contains parameters for creating a snapshot
+message SnapshotRequest {
+  string id = 1;                 // Sandbox ID
+  string name = 2;               // Snapshot name
+  map<string, string> labels = 3;
+}
+
+// SnapshotResponse contains the result of a Snapshot operation
+message SnapshotResponse {
+  string snapshot_id = 1;
+  string created_at = 2;
+}
+
+// RestoreRequest contains parameters for restoring from a snapshot
+message RestoreRequest {
+  string snapshot_id = 1;
+  string new_id = 2;             // New sandbox ID after restore
+}
+
+// RestoreResponse contains the result of a Restore operation
+message RestoreResponse {
+  string id = 1;
+  string state = 2;
+}

@@ -1,436 +1,367 @@
+// xrun is the client CLI for xrund daemon.
 package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
+	"text/tabwriter"
+	"time"
 
-	"github.com/microvm/sandbox/pkg/log"
-	"github.com/microvm/sandbox/pkg/sandbox"
-	"github.com/microvm/sandbox/pkg/vmm"
-	"github.com/microvm/sandbox/pkg/vmm/cloudhypervisor"
+	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "github.com/microvm/sandbox/api/proto"
 )
 
-// CreateFlags holds the flags for the create command.
-type CreateFlags struct {
-	ID         string
-	Image      string
-	RootFS     string
-	VCPUs      uint
-	Memory     uint
-	MemBackend string
-	MemFile    string
-	Cmdline    string
-	VMM        string
-	AutoStart  bool
-}
+const defaultSocket = "/run/xrun/xrund.sock"
 
 func main() {
-	if err := run(); err != nil {
+	if err := newRootCmd().Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	// Initialize logging
-	if err := log.Init("/var/log/xrun"); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to initialize logging: %v\n", err)
+func newRootCmd() *cobra.Command {
+	var socketPath string
+
+	cmd := &cobra.Command{
+		Use:   "xrun",
+		Short: "Client for xrund - microVM sandbox manager",
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	cmd.PersistentFlags().StringVar(&socketPath, "socket", defaultSocket, "Path to xrund socket")
 
-	log.Info("Starting xrun...")
+	cmd.AddCommand(newRunCmd(&socketPath))
+	cmd.AddCommand(newStopCmd(&socketPath))
+	cmd.AddCommand(newDeleteCmd(&socketPath))
+	cmd.AddCommand(newListCmd(&socketPath))
+	cmd.AddCommand(newGetCmd(&socketPath))
+	cmd.AddCommand(newSnapshotCmd(&socketPath))
+	cmd.AddCommand(newRestoreCmd(&socketPath))
 
-	// Handle signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		cancel()
-	}()
+	return cmd
+}
 
-	// Setup VMM factory
-	factory := vmm.NewFactory()
-
-	// Register Cloud-Hypervisor driver (default)
-	chDriver := cloudhypervisor.NewDriver("cloud-hypervisor", "/var/lib/sandbox/vms")
-	factory.Register("cloud-hypervisor", chDriver)
-
-	// Setup sandbox manager
-	manager, err := sandbox.NewManager(sandbox.Config{
-		DataDir:             "/var/lib/sandbox",
-		DefaultVMM:          "cloud-hypervisor",
-		ContainerdAddress:   "/run/containerd/containerd.sock",
-		ContainerdNamespace: "default",
-		Snapshotter:         "overlayfs",
-	}, factory)
+func newClient(socketPath string) (pb.SandboxServiceClient, *grpc.ClientConn, error) {
+	conn, err := grpc.Dial(
+		"unix://"+socketPath,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
 	if err != nil {
-		return fmt.Errorf("failed to create sandbox manager: %w", err)
-	}
-	defer manager.Close()
-
-	// Parse command
-	if len(os.Args) < 2 {
-		return printUsage()
+		return nil, nil, fmt.Errorf("failed to connect to xrund: %w", err)
 	}
 
-	cmd := os.Args[1]
-
-	switch cmd {
-	case "create":
-		return handleCreate(ctx, manager, os.Args[2:])
-	case "start":
-		return handleStart(ctx, manager, os.Args[2:])
-	case "stop":
-		return handleStop(ctx, manager, os.Args[2:])
-	case "list":
-		return handleList(ctx, manager, os.Args[2:])
-	case "snapshot":
-		return handleSnapshot(ctx, manager, os.Args[2:])
-	case "restore":
-		return handleRestore(ctx, manager, os.Args[2:])
-	case "pause":
-		return handlePause(ctx, manager, os.Args[2:])
-	case "resume":
-		return handleResume(ctx, manager, os.Args[2:])
-	case "delete":
-		return handleDelete(ctx, manager, os.Args[2:])
-	case "help", "--help", "-h":
-		return printUsage()
-	default:
-		return fmt.Errorf("unknown command: %s", cmd)
-	}
+	return pb.NewSandboxServiceClient(conn), conn, nil
 }
 
-func printUsage() error {
-	fmt.Println(`MicroVM Sandbox Manager
+func newRunCmd(socketPath *string) *cobra.Command {
+	var (
+		image   string
+		rootfs  string
+		vcpus   uint32
+		memory  uint32
+		cmdline string
+		labels  []string
+	)
 
-Usage:
-  xrun <command> [options]
+	cmd := &cobra.Command{
+		Use:   "run [ID]",
+		Short: "Create and start a new sandbox",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := args[0]
 
-Commands:
-  create     Create a new sandbox from OCI image
-  start      Start an existing sandbox
-  stop       Stop a running sandbox
-  list       List all sandboxes
-  snapshot   Create a snapshot of a sandbox
-  restore    Restore a sandbox from snapshot
-  pause      Pause a running sandbox
-  resume     Resume a paused sandbox
-  delete     Delete a sandbox
-  help       Show this help message
-
-Create Options:
-  -id            Sandbox identifier (required)
-  -image         OCI image reference containing kernel and initrd (required)
-  -rootfs        Path to root filesystem disk image (optional)
-  -vcpus         Number of vCPUs (default: 1)
-  -memory        Memory size in MB (default: 512)
-  -mem-backend   Memory backend type: anonymous, file (default: anonymous)
-  -mem-file      Path to memory backend file (when mem-backend=file)
-  -cmdline       Kernel command line (default: "console=hvc0 root=/dev/vda1 rw")
-  -vmm           VMM driver to use (default: cloud-hypervisor)
-  -start         Auto-start the VM after creation
-
-Examples:
-  # Create sandbox from OCI image
-  xrun create -id myvm -image docker.io/myrepo/vm-image:v1.0 -rootfs /path/to/rootfs.img -vcpus 2 -memory 1024
-
-  # With custom cmdline
-  xrun create -id myvm -image docker.io/myrepo/vm-image:v1.0 -cmdline "console=ttyS0 root=/dev/vda1 rw quiet"
-
-  xrun start -id myvm
-  xrun stop -id myvm
-  xrun list
-  xrun snapshot -id myvm -dest /path/to/snapshot
-  xrun restore -id myvm -source /path/to/snapshot`)
-	return nil
-}
-
-func handleCreate(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	log.Info("Creating sandbox with args: %v", args)
-
-	fs := flag.NewFlagSet("create", flag.ContinueOnError)
-
-	var flags CreateFlags
-	fs.StringVar(&flags.ID, "id", "", "Sandbox identifier (required)")
-	fs.StringVar(&flags.Image, "image", "", "OCI image reference containing kernel and initrd (required)")
-	fs.StringVar(&flags.RootFS, "rootfs", "", "Path to root filesystem disk image (optional)")
-	fs.UintVar(&flags.VCPUs, "vcpus", 1, "Number of vCPUs")
-	fs.UintVar(&flags.Memory, "memory", 512, "Memory size in MB")
-	fs.StringVar(&flags.MemBackend, "mem-backend", "anonymous", "Memory backend type: anonymous, file")
-	fs.StringVar(&flags.MemFile, "mem-file", "", "Path to memory backend file (when mem-backend=file)")
-	fs.StringVar(&flags.Cmdline, "cmdline", "console=hvc0 root=/dev/vda1 rw", "Kernel command line")
-	fs.StringVar(&flags.VMM, "vmm", "cloud-hypervisor", "VMM driver to use")
-	fs.BoolVar(&flags.AutoStart, "start", false, "Auto-start the VM after creation")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	// Validate required flags
-	if flags.ID == "" {
-		return fmt.Errorf("-id is required")
-	}
-	if flags.Image == "" {
-		return fmt.Errorf("-image is required")
-	}
-
-	log.Info("Creating sandbox %s with image %s", flags.ID, flags.Image)
-
-	// Build options
-	opts := sandbox.CreateOptions{
-		VMM:       flags.VMM,
-		VCPUs:     uint32(flags.VCPUs),
-		AutoStart: flags.AutoStart,
-		Image:     flags.Image,
-		Memory: vmm.MemoryConfig{
-			SizeMB:      uint32(flags.Memory),
-			Backend:     vmm.MemoryBackendType(flags.MemBackend),
-			BackendPath: flags.MemFile,
-		},
-		Boot: vmm.BootConfig{
-			Cmdline: flags.Cmdline,
-		},
-	}
-
-	// Build rootfs disk config if provided
-	if flags.RootFS != "" {
-		opts.RootFS = vmm.DiskConfig{
-			Path:     flags.RootFS,
-			ReadOnly: false,
-			Format:   "raw",
-		}
-	}
-
-	if err := manager.Create(ctx, flags.ID, opts); err != nil {
-		log.Error("Failed to create sandbox %s: %v", flags.ID, err)
-		return err
-	}
-
-	log.Info("Successfully created sandbox %s", flags.ID)
-	fmt.Printf("Created sandbox %s\n", flags.ID)
-	return nil
-}
-
-func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	log.Info("Starting sandbox with args: %v", args)
-
-	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	var id string
-	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if id == "" {
-		return fmt.Errorf("-id is required")
-	}
-
-	log.Info("Loading VM for sandbox %s", id)
-
-	vm, err := manager.Get(ctx, id)
-	if err != nil {
-		log.Error("Failed to get sandbox %s: %v", id, err)
-		return fmt.Errorf("failed to load sandbox %s: %w", id, err)
-	}
-
-	log.Info("Starting VM for sandbox %s", id)
-
-	if err := vm.Start(ctx); err != nil {
-		log.Error("Failed to start VM for sandbox %s: %v", id, err)
-		return err
-	}
-
-	// Update state in storage
-	if err := manager.UpdateSandboxState(id, vmm.VMStateRunning); err != nil {
-		fmt.Printf("Warning: failed to update sandbox state: %v\n", err)
-	}
-
-	// Get PID from VM and save to storage
-	if info, err := vm.Info(ctx); err == nil {
-		if info.PID > 0 {
-			if err := manager.UpdateSandboxPID(id, info.PID); err != nil {
-				fmt.Printf("Warning: failed to update sandbox PID: %v\n", err)
+			client, conn, err := newClient(*socketPath)
+			if err != nil {
+				return err
 			}
+			defer conn.Close()
+
+			labelMap := parseLabels(labels)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			resp, err := client.Run(ctx, &pb.RunRequest{
+				Id:       id,
+				Image:    image,
+				Rootfs:   rootfs,
+				Vcpus:    vcpus,
+				MemoryMb: memory,
+				Cmdline:  cmdline,
+				Labels:   labelMap,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to run sandbox: %w", err)
+			}
+
+			fmt.Printf("Sandbox %s started\n", resp.Id)
+			fmt.Printf("State: %s\n", resp.State)
+			fmt.Printf("PID: %d\n", resp.Pid)
+			if resp.IpAddress != "" {
+				fmt.Printf("IP: %s\n", resp.IpAddress)
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&image, "image", "i", "", "OCI image reference (required)")
+	cmd.Flags().StringVarP(&rootfs, "rootfs", "r", "", "Rootfs disk path")
+	cmd.Flags().Uint32VarP(&vcpus, "vcpus", "c", 1, "Number of vCPUs")
+	cmd.Flags().Uint32VarP(&memory, "memory", "m", 512, "Memory in MB")
+	cmd.Flags().StringVar(&cmdline, "cmdline", "console=hvc0 root=/dev/vda1 rw", "Kernel command line")
+	cmd.Flags().StringArrayVarP(&labels, "label", "l", nil, "Labels (key=value)")
+	cmd.MarkFlagRequired("image")
+
+	return cmd
+}
+
+func newStopCmd(socketPath *string) *cobra.Command {
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:   "stop [ID]",
+		Short: "Stop a running sandbox",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := args[0]
+
+			client, conn, err := newClient(*socketPath)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			resp, err := client.Stop(ctx, &pb.StopRequest{
+				Id:    id,
+				Force: force,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to stop sandbox: %w", err)
+			}
+
+			fmt.Printf("Sandbox %s stopped\n", resp.Id)
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "Force stop")
+
+	return cmd
+}
+
+func newDeleteCmd(socketPath *string) *cobra.Command {
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:   "delete [ID]",
+		Short: "Delete a sandbox",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := args[0]
+
+			client, conn, err := newClient(*socketPath)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			_, err = client.Delete(ctx, &pb.DeleteRequest{
+				Id:    id,
+				Force: force,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to delete sandbox: %w", err)
+			}
+
+			fmt.Printf("Sandbox %s deleted\n", id)
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "Force delete")
+
+	return cmd
+}
+
+func newListCmd(socketPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List all sandboxes",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, conn, err := newClient(*socketPath)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			resp, err := client.List(ctx, &pb.ListRequest{})
+			if err != nil {
+				return fmt.Errorf("failed to list sandboxes: %w", err)
+			}
+
+			if len(resp.Sandboxes) == 0 {
+				fmt.Println("No sandboxes found")
+				return nil
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+			fmt.Fprintln(w, "ID\tSTATE\tPID\tVCPUS\tMEMORY\tIMAGE\tIP")
+			for _, sb := range resp.Sandboxes {
+				fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%dMB\t%s\t%s\n",
+					sb.Id, sb.State, sb.Pid, sb.Vcpus, sb.MemoryMb,
+					sb.Image, sb.IpAddress)
+			}
+			w.Flush()
+
+			return nil
+		},
+	}
+}
+
+func newGetCmd(socketPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "get [ID]",
+		Short: "Get sandbox details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := args[0]
+
+			client, conn, err := newClient(*socketPath)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			resp, err := client.Get(ctx, &pb.GetRequest{Id: id})
+			if err != nil {
+				return fmt.Errorf("failed to get sandbox: %w", err)
+			}
+
+			sb := resp.Sandbox
+			fmt.Printf("ID: %s\n", sb.Id)
+			fmt.Printf("State: %s\n", sb.State)
+			fmt.Printf("PID: %d\n", sb.Pid)
+			fmt.Printf("VCPUs: %d\n", sb.Vcpus)
+			fmt.Printf("Memory: %dMB\n", sb.MemoryMb)
+			fmt.Printf("Image: %s\n", sb.Image)
+			fmt.Printf("Rootfs: %s\n", sb.Rootfs)
+			fmt.Printf("IP: %s\n", sb.IpAddress)
+			fmt.Printf("Created: %s\n", sb.CreatedAt)
+
+			return nil
+		},
+	}
+}
+
+func newSnapshotCmd(socketPath *string) *cobra.Command {
+	var name string
+
+	cmd := &cobra.Command{
+		Use:   "snapshot [ID]",
+		Short: "Create a snapshot of a sandbox",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := args[0]
+
+			client, conn, err := newClient(*socketPath)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			resp, err := client.Snapshot(ctx, &pb.SnapshotRequest{
+				Id:   id,
+				Name: name,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create snapshot: %w", err)
+			}
+
+			fmt.Printf("Snapshot created: %s\n", resp.SnapshotId)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&name, "name", "n", "", "Snapshot name (required)")
+	cmd.MarkFlagRequired("name")
+
+	return cmd
+}
+
+func newRestoreCmd(socketPath *string) *cobra.Command {
+	var newID string
+
+	cmd := &cobra.Command{
+		Use:   "restore [SNAPSHOT_ID]",
+		Short: "Restore a sandbox from a snapshot",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			snapshotID := args[0]
+
+			client, conn, err := newClient(*socketPath)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			resp, err := client.Restore(ctx, &pb.RestoreRequest{
+				SnapshotId: snapshotID,
+				NewId:      newID,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to restore sandbox: %w", err)
+			}
+
+			fmt.Printf("Sandbox restored: %s\n", resp.Id)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&newID, "new-id", "", "New ID for restored sandbox (required)")
+	cmd.MarkFlagRequired("new-id")
+
+	return cmd
+}
+
+func parseLabels(labels []string) map[string]string {
+	result := make(map[string]string)
+	for _, label := range labels {
+		parts := splitLabel(label)
+		if len(parts) == 2 {
+			result[parts[0]] = parts[1]
 		}
 	}
-
-	log.Info("Successfully started sandbox %s", id)
-	fmt.Printf("Started sandbox %s\n", id)
-	return nil
+	return result
 }
 
-func handleStop(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
-	var id string
-	var force bool
-	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
-	fs.BoolVar(&force, "force", false, "Force stop")
-
-	if err := fs.Parse(args); err != nil {
-		return err
+func splitLabel(label string) []string {
+	for i, c := range label {
+		if c == '=' {
+			return []string{label[:i], label[i+1:]}
+		}
 	}
-
-	if id == "" {
-		return fmt.Errorf("-id is required")
-	}
-
-	if err := manager.Stop(ctx, id, force); err != nil {
-		return err
-	}
-
-	// Update state in storage
-	if err := manager.UpdateSandboxState(id, vmm.VMStateStopped); err != nil {
-		fmt.Printf("Warning: failed to update sandbox state: %v\n", err)
-	}
-
-	fmt.Printf("Stopped sandbox %s\n", id)
-	return nil
-}
-
-func handleList(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	vms, err := manager.List(ctx)
-	if err != nil {
-		return err
-	}
-
-	if len(vms) == 0 {
-		fmt.Println("No sandboxes found")
-		return nil
-	}
-
-	fmt.Printf("%-20s %-10s %-6s %-8s %-10s\n", "ID", "STATE", "PID", "VCPUS", "MEMORY")
-	fmt.Println(string(make([]byte, 60)))
-	for _, vm := range vms {
-		fmt.Printf("%-20s %-10s %-6d %-8d %-10d\n",
-			vm.ID, vm.State, vm.PID, vm.VCPUs, vm.MemoryMB)
-	}
-	return nil
-}
-
-func handleSnapshot(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
-	var id, dest string
-	var compress bool
-	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
-	fs.StringVar(&dest, "dest", "", "Snapshot destination path (required)")
-	fs.BoolVar(&compress, "compress", false, "Compress snapshot")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if id == "" || dest == "" {
-		return fmt.Errorf("-id and -dest are required")
-	}
-
-	opts := sandbox.SnapshotOptions{
-		Destination: dest,
-		Compress:    compress,
-	}
-
-	if err := manager.Snapshot(ctx, id, opts); err != nil {
-		return err
-	}
-
-	fmt.Printf("Created snapshot of sandbox %s at %s\n", id, dest)
-	return nil
-}
-
-func handleRestore(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
-	var id, source string
-	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
-	fs.StringVar(&source, "source", "", "Snapshot source path (required)")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if id == "" || source == "" {
-		return fmt.Errorf("-id and -source are required")
-	}
-
-	opts := sandbox.RestoreOptions{
-		Source: source,
-	}
-
-	if err := manager.Restore(ctx, id, opts); err != nil {
-		return err
-	}
-
-	fmt.Printf("Restored sandbox %s from %s\n", id, source)
-	return nil
-}
-
-func handlePause(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	fs := flag.NewFlagSet("pause", flag.ContinueOnError)
-	var id string
-	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if id == "" {
-		return fmt.Errorf("-id is required")
-	}
-
-	if err := manager.Pause(ctx, id); err != nil {
-		return err
-	}
-
-	fmt.Printf("Paused sandbox %s\n", id)
-	return nil
-}
-
-func handleResume(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
-	var id string
-	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if id == "" {
-		return fmt.Errorf("-id is required")
-	}
-
-	if err := manager.Resume(ctx, id); err != nil {
-		return err
-	}
-
-	fmt.Printf("Resumed sandbox %s\n", id)
-	return nil
-}
-
-func handleDelete(ctx context.Context, manager *sandbox.Manager, args []string) error {
-	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
-	var id string
-	var force bool
-	fs.StringVar(&id, "id", "", "Sandbox identifier (required)")
-	fs.BoolVar(&force, "force", false, "Force delete")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if id == "" {
-		return fmt.Errorf("-id is required")
-	}
-
-	if err := manager.Delete(ctx, id, force); err != nil {
-		return err
-	}
-
-	fmt.Printf("Deleted sandbox %s\n", id)
-	return nil
+	return []string{label}
 }
