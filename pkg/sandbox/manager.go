@@ -193,6 +193,11 @@ func (m *Manager) LoadVM(ctx context.Context, id string) (vmm.VM, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	return m.loadVMUnlocked(ctx, id)
+}
+
+// loadVMUnlocked is the internal implementation of LoadVM that assumes the lock is already held.
+func (m *Manager) loadVMUnlocked(ctx context.Context, id string) (vmm.VM, error) {
 	log.Info("Loading VM for sandbox %s from metadata", id)
 
 	// Check if already loaded
@@ -260,6 +265,12 @@ func (m *Manager) LoadVM(ctx context.Context, id string) (vmm.VM, error) {
 	vm, err := driver.Create(ctx, vmConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create VM from metadata: %w", err)
+	}
+
+	// Sync state from storage to VM instance
+	// This ensures the VM state matches the persisted state
+	if info, ok := vm.(interface{ SetState(vmm.VMState) }); ok {
+		info.SetState(meta.State)
 	}
 
 	// Save to memory
@@ -420,8 +431,8 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 		if !force {
 			return fmt.Errorf("sandbox appears to be running but not in memory, use force to delete")
 		}
-		// Try to load and stop
-		if loadedVM, err := m.LoadVM(ctx, id); err == nil {
+		// Try to load and stop (use unlocked version since we already hold the lock)
+		if loadedVM, err := m.loadVMUnlocked(ctx, id); err == nil {
 			_ = loadedVM.ForceStop(ctx)
 		}
 	}

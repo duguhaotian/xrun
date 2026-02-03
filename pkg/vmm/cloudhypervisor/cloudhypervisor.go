@@ -136,6 +136,11 @@ func (vm *cloudHypervisorVM) ID() string {
 	return vm.id
 }
 
+// SetState sets the VM state (used when loading from storage).
+func (vm *cloudHypervisorVM) SetState(state vmm.VMState) {
+	vm.state = state
+}
+
 // Start starts the VM.
 func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	if vm.state == vmm.VMStateRunning {
@@ -261,8 +266,22 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 
 // Stop stops the VM gracefully.
 func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
+	// Check if VM is actually running by checking the process
 	if vm.state != vmm.VMStateRunning {
-		return fmt.Errorf("VM is not running")
+		return fmt.Errorf("VM is not running (current state: %s)", vm.state)
+	}
+
+	// Double-check if the process is actually alive
+	if vm.cmd == nil || vm.cmd.Process == nil {
+		vm.state = vmm.VMStateStopped
+		return fmt.Errorf("VM process is not running")
+	}
+
+	// Check if process is still alive
+	if err := vm.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		// Process is not running, update state
+		vm.state = vmm.VMStateStopped
+		return fmt.Errorf("VM process is not running (may have crashed or been killed)")
 	}
 
 	// Send shutdown signal via API
@@ -385,6 +404,15 @@ func (vm *cloudHypervisorVM) Restore(ctx context.Context, config vmm.RestoreConf
 
 // Info returns current VM information.
 func (vm *cloudHypervisorVM) Info(ctx context.Context) (vmm.VMInfo, error) {
+	// Check if the VM process is actually running
+	if vm.state == vmm.VMStateRunning && vm.cmd != nil && vm.cmd.Process != nil {
+		// Check if process is still alive
+		if err := vm.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			// Process is not running, update state
+			vm.state = vmm.VMStateStopped
+		}
+	}
+
 	info := vmm.VMInfo{
 		ID:         vm.id,
 		State:      vm.state,
