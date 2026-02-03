@@ -211,9 +211,11 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 			Cmdline:    req.Cmdline,
 		},
 		RootFS:    req.Rootfs,
-		NetNS:     vmNet.NetNS.Path,
 		TapDevice: vmNet.TapDevice,
 		VMIP:      vmNet.VMIP,
+	}
+	if vmNet.NetNS != nil {
+		vmConfig.NetNS = vmNet.NetNS.Path
 	}
 
 	// 5. Create VM
