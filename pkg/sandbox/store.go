@@ -128,13 +128,39 @@ func (s *Store) UpdateState(id string, state vmm.VMState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	meta, err := s.Load(id)
+	// Load metadata directly without calling Load() to avoid lock reentrancy
+	metaPath := filepath.Join(s.dataDir, "sandboxes", id, "meta.json")
+	data, err := os.ReadFile(metaPath)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return fmt.Errorf("sandbox %s not found", id)
+		}
+		return fmt.Errorf("failed to read metadata file: %w", err)
+	}
+
+	var meta SandboxMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
 	meta.State = state
-	return s.Save(meta)
+
+	// Save directly without calling Save() to avoid lock reentrancy
+	sandboxDir := filepath.Join(s.dataDir, "sandboxes", meta.ID)
+	if err := os.MkdirAll(sandboxDir, 0755); err != nil {
+		return fmt.Errorf("failed to create sandbox directory: %w", err)
+	}
+
+	data, err = json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	if err := os.WriteFile(metaPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write metadata file: %w", err)
+	}
+
+	return nil
 }
 
 // Delete removes sandbox metadata from disk.

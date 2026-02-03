@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -68,7 +70,7 @@ func GetLogger() *Logger {
 	return defaultLogger
 }
 
-// log writes a log message.
+// log writes a log message with file and line number.
 func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 	if level < l.level {
 		return
@@ -80,8 +82,19 @@ func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	levelStr := []string{"DEBUG", "INFO", "WARN", "ERROR"}[level]
 
+	// Get caller information (skip 3 frames: log -> Debug/Info/Warn/Error -> caller)
+	_, file, line, ok := runtime.Caller(3)
+	if !ok {
+		file = "???"
+		line = 0
+	}
+	// Extract just the filename from the full path
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		file = file[idx+1:]
+	}
+
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.writer, "[%s] [%s] %s\n", timestamp, levelStr, msg)
+	fmt.Fprintf(l.writer, "[%s] [%s] [%s:%d] %s\n", timestamp, levelStr, file, line, msg)
 }
 
 // Debug logs debug message.
