@@ -122,6 +122,20 @@ func (s *Store) List() ([]*SandboxMeta, error) {
 	return metas, nil
 }
 
+// UpdateState updates the sandbox state in storage.
+func (s *Store) UpdateState(id string, state vmm.VMState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	meta, err := s.Load(id)
+	if err != nil {
+		return err
+	}
+
+	meta.State = state
+	return s.Save(meta)
+}
+
 // Delete removes sandbox metadata from disk.
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()

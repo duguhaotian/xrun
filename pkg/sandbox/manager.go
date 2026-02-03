@@ -270,11 +270,27 @@ func (m *Manager) List(ctx context.Context) ([]vmm.VMInfo, error) {
 	return infos, nil
 }
 
+// UpdateSandboxState updates the state of a sandbox in storage.
+func (m *Manager) UpdateSandboxState(id string, state vmm.VMState) error {
+	return m.store.UpdateState(id, state)
+}
+
 // Stop stops a sandbox gracefully.
 func (m *Manager) Stop(ctx context.Context, id string, force bool) error {
 	vm, err := m.Get(ctx, id)
 	if err != nil {
 		return err
+	}
+
+	// Check state from persistent storage
+	meta, err := m.store.Load(id)
+	if err != nil {
+		return err
+	}
+
+	// If not running according to storage, return early
+	if meta.State != vmm.VMStateRunning {
+		return fmt.Errorf("sandbox %s is not running (current state: %s)", id, meta.State)
 	}
 
 	if force {
@@ -349,19 +365,34 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	vm, ok := m.sandboxes[id]
-	if !ok {
-		return fmt.Errorf("sandbox %s not found", id)
+	// Load metadata from storage to check state
+	meta, err := m.store.Load(id)
+	if err != nil {
+		return fmt.Errorf("sandbox %s not found: %w", id, err)
 	}
 
-	info, err := vm.Info(ctx)
-	if err == nil && info.State == vmm.VMStateRunning {
-		if force {
-			if err := vm.ForceStop(ctx); err != nil {
-				return fmt.Errorf("failed to stop VM: %w", err)
+	// Try to get VM from memory
+	vm, ok := m.sandboxes[id]
+	if ok {
+		// Check if VM is running and stop if needed
+		info, err := vm.Info(ctx)
+		if err == nil && info.State == vmm.VMStateRunning {
+			if force {
+				if err := vm.ForceStop(ctx); err != nil {
+					return fmt.Errorf("failed to stop VM: %w", err)
+				}
+			} else {
+				return fmt.Errorf("sandbox is running, stop it first or use force")
 			}
-		} else {
-			return fmt.Errorf("sandbox is running, stop it first or use force")
+		}
+	} else if meta.State == vmm.VMStateRunning {
+		// VM not in memory but storage says it's running
+		if !force {
+			return fmt.Errorf("sandbox appears to be running but not in memory, use force to delete")
+		}
+		// Try to load and stop
+		if loadedVM, err := m.LoadVM(ctx, id); err == nil {
+			_ = loadedVM.ForceStop(ctx)
 		}
 	}
 
@@ -371,7 +402,9 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 	delete(m.sandboxes, id)
 
 	// Delete metadata from store
-	_ = m.store.Delete(id)
+	if err := m.store.Delete(id); err != nil {
+		return fmt.Errorf("failed to delete sandbox metadata: %w", err)
+	}
 
 	return nil
 }

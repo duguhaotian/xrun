@@ -226,6 +226,11 @@ func handleStart(ctx context.Context, manager *sandbox.Manager, args []string) e
 		return err
 	}
 
+	// Update state in storage
+	if err := manager.UpdateSandboxState(id, vmm.VMStateRunning); err != nil {
+		fmt.Printf("Warning: failed to update sandbox state: %v\n", err)
+	}
+
 	fmt.Printf("Started sandbox %s\n", id)
 	return nil
 }
@@ -247,6 +252,11 @@ func handleStop(ctx context.Context, manager *sandbox.Manager, args []string) er
 
 	if err := manager.Stop(ctx, id, force); err != nil {
 		return err
+	}
+
+	// Update state in storage
+	if err := manager.UpdateSandboxState(id, vmm.VMStateStopped); err != nil {
+		fmt.Printf("Warning: failed to update sandbox state: %v\n", err)
 	}
 
 	fmt.Printf("Stopped sandbox %s\n", id)

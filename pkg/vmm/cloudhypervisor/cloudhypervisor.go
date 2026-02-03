@@ -382,6 +382,9 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 			vm.config.Network.IPAddr))
 	}
 
+	// Disable console to avoid interfering with terminal
+	args = append(args, "--console", "null")
+
 	return args
 }
 
