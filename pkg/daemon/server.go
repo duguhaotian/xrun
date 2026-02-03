@@ -243,17 +243,21 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 
 	// 7. Save metadata
 	meta := sandbox.CreateMeta(req.Id, s.config.VMM.DefaultDriver, req.Vcpus, req.MemoryMb)
-	meta.Image = req.Image
-	meta.RootFS = req.Rootfs
 	meta.Cmdline = req.Cmdline
 	meta.State = vmm.VMStateRunning
 	meta.PID = vmInfo.PID
 	meta.MemorySnapshot = memFile.SnapshotKey
-	meta.ImageMount = imgMount.MountPath
-	meta.NetNS = vmNet.NetNS.Path
-	meta.TapDevice = vmNet.TapDevice
-	meta.IPAddr = vmNet.HostIP
 	meta.Labels = req.Labels
+
+	// Set image info
+	meta.SetImageInfo(req.Image, imgMount.MountPath, req.Rootfs, imgMount.KernelPath, imgMount.InitrdPath)
+
+	// Set network info (safely handle nil NetNS)
+	if vmNet.NetNS != nil {
+		meta.SetNetworkInfo(vmNet.NetNS.Path, vmNet.TapDevice, vmNet.HostIP, true)
+	} else {
+		meta.SetNetworkInfo("", vmNet.TapDevice, vmNet.HostIP, false)
+	}
 
 	if err := s.store.Save(meta); err != nil {
 		vm.ForceStop(ctx)
@@ -474,16 +478,15 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 	if err != nil {
 		// Try to get from snapshot metadata
 		log.Warn("Could not load original metadata, using defaults")
-		meta = &sandbox.Meta{
-			VCPUs:    1,
-			MemoryMB: 512,
-			Image:    "",
-			Cmdline:  "console=hvc0 root=/dev/vda1 rw",
-		}
+		meta = sandbox.CreateMeta(req.SnapshotId, s.config.VMM.DefaultDriver, 1, 512)
+		meta.Cmdline = "console=hvc0 root=/dev/vda1 rw"
 	}
 
+	// Get image reference from meta
+	imageRef := meta.GetImageRef()
+
 	// Get or mount image
-	imgMount, err := s.imageCache.GetOrMount(ctx, meta.Image)
+	imgMount, err := s.imageCache.GetOrMount(ctx, imageRef)
 	if err != nil {
 		s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey)
 		return nil, fmt.Errorf("failed to mount image: %w", err)
@@ -492,7 +495,7 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 	// Setup network
 	vmNet, err := s.netMgr.Setup(ctx, req.NewId)
 	if err != nil {
-		s.imageCache.Release(meta.Image)
+		s.imageCache.Release(imageRef)
 		s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey)
 		return nil, fmt.Errorf("failed to setup network: %w", err)
 	}
@@ -518,17 +521,19 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 			InitrdPath: imgMount.InitrdPath,
 			Cmdline:    meta.Cmdline,
 		},
-		RootFS:    meta.RootFS,
-		NetNS:     vmNet.NetNS.Path,
+		RootFS:    meta.GetImageInfo().RootFS,
 		TapDevice: vmNet.TapDevice,
 		VMIP:      vmNet.VMIP,
+	}
+	if vmNet.NetNS != nil {
+		vmConfig.NetNS = vmNet.NetNS.Path
 	}
 
 	// Create VM
 	vm, err := driver.Create(ctx, vmConfig)
 	if err != nil {
 		s.netMgr.Cleanup(ctx, req.NewId, vmNet.NetNS)
-		s.imageCache.Release(meta.Image)
+		s.imageCache.Release(imageRef)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
@@ -536,7 +541,7 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 	vmStatePath := s.storageMgr.GetVMStatePath(req.SnapshotId)
 	if err := vm.Restore(ctx, vmStatePath); err != nil {
 		s.netMgr.Cleanup(ctx, req.NewId, vmNet.NetNS)
-		s.imageCache.Release(meta.Image)
+		s.imageCache.Release(imageRef)
 		return nil, fmt.Errorf("failed to restore VM state: %w", err)
 	}
 
@@ -548,21 +553,25 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 
 	// Save metadata
 	newMeta := sandbox.CreateMeta(req.NewId, s.config.VMM.DefaultDriver, meta.VCPUs, meta.MemoryMB)
-	newMeta.Image = meta.Image
-	newMeta.RootFS = meta.RootFS
 	newMeta.Cmdline = meta.Cmdline
 	newMeta.State = vmm.VMStateRunning
 	newMeta.PID = vmInfo.PID
 	newMeta.MemorySnapshot = memFile.SnapshotKey
-	newMeta.ImageMount = imgMount.MountPath
-	newMeta.NetNS = vmNet.NetNS.Path
-	newMeta.TapDevice = vmNet.TapDevice
-	newMeta.IPAddr = vmNet.HostIP
+
+	// Set image info
+	newMeta.SetImageInfo(imageRef, imgMount.MountPath, meta.GetImageInfo().RootFS, imgMount.KernelPath, imgMount.InitrdPath)
+
+	// Set network info
+	if vmNet.NetNS != nil {
+		newMeta.SetNetworkInfo(vmNet.NetNS.Path, vmNet.TapDevice, vmNet.HostIP, true)
+	} else {
+		newMeta.SetNetworkInfo("", vmNet.TapDevice, vmNet.HostIP, false)
+	}
 
 	if err := s.store.Save(newMeta); err != nil {
 		vm.ForceStop(ctx)
 		s.netMgr.Cleanup(ctx, req.NewId, vmNet.NetNS)
-		s.imageCache.Release(meta.Image)
+		s.imageCache.Release(imageRef)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
@@ -572,7 +581,7 @@ func (s *Server) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Resto
 		Meta:     newMeta,
 		VM:       vm,
 		NetNS:    vmNet.NetNS,
-		ImageRef: meta.Image,
+		ImageRef: imageRef,
 	}
 	s.mu.Unlock()
 
@@ -590,9 +599,9 @@ func metaToProto(meta *sandbox.Meta) *pb.Sandbox {
 		Pid:       int32(meta.PID),
 		Vcpus:     meta.VCPUs,
 		MemoryMb:  meta.MemoryMB,
-		Image:     meta.Image,
-		Rootfs:    meta.RootFS,
-		IpAddress: meta.IPAddr,
+		Image:     meta.GetImageRef(),
+		Rootfs:    meta.GetImageInfo().RootFS,
+		IpAddress: meta.GetIPAddr(),
 		CreatedAt: meta.CreatedAt,
 		Labels:    meta.Labels,
 	}

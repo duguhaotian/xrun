@@ -12,24 +12,40 @@ import (
 	"github.com/microvm/sandbox/pkg/vmm"
 )
 
+// NetworkInfo holds network-related metadata for a sandbox.
+type NetworkInfo struct {
+	NetNS     string `json:"netns,omitempty"`      // Network namespace path
+	TapDevice string `json:"tap_device,omitempty"` // TAP device name
+	IPAddr    string `json:"ip_addr,omitempty"`    // IP address
+	Gateway   string `json:"gateway,omitempty"`    // Gateway IP
+	Enabled   bool   `json:"enabled"`              // Whether network is enabled
+}
+
+// ImageInfo holds image-related metadata for a sandbox.
+type ImageInfo struct {
+	Image      string `json:"image"`                 // Image reference
+	ImageMount string `json:"image_mount,omitempty"` // Path to mounted image
+	RootFS     string `json:"rootfs,omitempty"`      // Root filesystem
+	KernelPath string `json:"kernel_path,omitempty"` // Kernel path
+	InitrdPath string `json:"initrd_path,omitempty"` // Initrd path
+}
+
 // Meta contains metadata for a sandbox.
 type Meta struct {
 	ID             string            `json:"id"`
 	VMM            string            `json:"vmm"`
 	VCPUs          uint32            `json:"vcpus"`
 	MemoryMB       uint32            `json:"memory_mb"`
-	Image          string            `json:"image"`
-	RootFS         string            `json:"rootfs,omitempty"`
 	Cmdline        string            `json:"cmdline"`
 	State          vmm.VMState       `json:"state"`
 	PID            int               `json:"pid,omitempty"`
 	MemorySnapshot string            `json:"memory_snapshot,omitempty"` // Key for memory file snapshot
-	ImageMount     string            `json:"image_mount,omitempty"`     // Path to mounted image
-	NetNS          string            `json:"netns,omitempty"`           // Network namespace path
-	TapDevice      string            `json:"tap_device,omitempty"`
-	IPAddr         string            `json:"ip_addr,omitempty"`
 	CreatedAt      string            `json:"created_at"`
 	Labels         map[string]string `json:"labels,omitempty"`
+
+	// Sub-structs for better organization and nil-safety
+	Network *NetworkInfo `json:"network,omitempty"`
+	Image   *ImageInfo   `json:"image,omitempty"`
 }
 
 // Store handles persistence of sandbox metadata.
@@ -173,4 +189,81 @@ func CreateMeta(id, vmmType string, vcpus, memoryMB uint32) *Meta {
 		CreatedAt: time.Now().Format(time.RFC3339),
 		Labels:    make(map[string]string),
 	}
+}
+
+// GetNetworkInfo returns network info, creating if nil.
+func (m *Meta) GetNetworkInfo() *NetworkInfo {
+	if m.Network == nil {
+		m.Network = &NetworkInfo{}
+	}
+	return m.Network
+}
+
+// GetImageInfo returns image info, creating if nil.
+func (m *Meta) GetImageInfo() *ImageInfo {
+	if m.Image == nil {
+		m.Image = &ImageInfo{}
+	}
+	return m.Image
+}
+
+// SetNetworkInfo sets network info from VMNetwork.
+func (m *Meta) SetNetworkInfo(netNSPath, tapDevice, ipAddr string, enabled bool) {
+	m.Network = &NetworkInfo{
+		NetNS:     netNSPath,
+		TapDevice: tapDevice,
+		IPAddr:    ipAddr,
+		Enabled:   enabled,
+	}
+}
+
+// SetImageInfo sets image info from image mount.
+func (m *Meta) SetImageInfo(image, mountPath, rootFS, kernelPath, initrdPath string) {
+	m.Image = &ImageInfo{
+		Image:      image,
+		ImageMount: mountPath,
+		RootFS:     rootFS,
+		KernelPath: kernelPath,
+		InitrdPath: initrdPath,
+	}
+}
+
+// GetNetNSPath returns the network namespace path or empty string if nil.
+func (m *Meta) GetNetNSPath() string {
+	if m.Network == nil {
+		return ""
+	}
+	return m.Network.NetNS
+}
+
+// GetTapDevice returns the TAP device name or empty string if nil.
+func (m *Meta) GetTapDevice() string {
+	if m.Network == nil {
+		return ""
+	}
+	return m.Network.TapDevice
+}
+
+// GetIPAddr returns the IP address or empty string if nil.
+func (m *Meta) GetIPAddr() string {
+	if m.Network == nil {
+		return ""
+	}
+	return m.Network.IPAddr
+}
+
+// GetImageMount returns the image mount path or empty string if nil.
+func (m *Meta) GetImageMount() string {
+	if m.Image == nil {
+		return ""
+	}
+	return m.Image.ImageMount
+}
+
+// GetImageRef returns the image reference or empty string if nil.
+func (m *Meta) GetImageRef() string {
+	if m.Image == nil {
+		return ""
+	}
+	return m.Image.Image
 }
