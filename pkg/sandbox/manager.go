@@ -409,7 +409,11 @@ func (m *Manager) Delete(ctx context.Context, id string, force bool) error {
 			SnapshotKey: meta.SnapshotKey,
 			MountPath:   meta.MountPath,
 		}
-		if err := rootfs.Cleanup(ctx, m.rootFSManager.Snapshotter()); err != nil {
+		// Use background context with timeout for cleanup
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := rootfs.Cleanup(cleanupCtx, m.rootFSManager.Snapshotter()); err != nil {
 			// Log warning but continue with deletion
 			fmt.Printf("Warning: failed to cleanup rootfs snapshot: %v\n", err)
 		}

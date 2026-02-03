@@ -146,27 +146,49 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	// Build log file path
 	logFile := filepath.Join(vm.driver.dataDir, vm.id, "vm.log")
 
+	// Ensure log directory exists
+	if err := os.MkdirAll(filepath.Dir(logFile), 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
+
 	// Open log file
 	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
-	defer f.Close()
 
+	// Create command (don't use CommandContext - we want the VM to keep running)
 	vm.cmd = exec.Command(vm.driver.binaryPath, args...)
 	vm.cmd.Stdout = f
 	vm.cmd.Stderr = f
 
-	// Don't set Setpgid - it causes issues with some VMMs
-	// The process will still run in background because we don't wait for it
+	// Set up process attributes for proper daemonization
+	vm.cmd.SysProcAttr = &syscall.SysProcAttr{
+		// Don't create a new session - this can cause issues
+		// Instead, just detach from parent's terminal
+		Setpgid: false,
+		Pgid:    0,
+	}
 
 	if err := vm.cmd.Start(); err != nil {
+		f.Close()
 		vm.state = vmm.VMStateFailed
 		return fmt.Errorf("failed to start VM: %w", err)
 	}
 
+	// Close file descriptor in parent process
+	f.Close()
+
 	vm.pid = vm.cmd.Process.Pid
 	vm.state = vmm.VMStateRunning
+
+	// Start a goroutine to wait for the process to avoid zombie
+	go func() {
+		if err := vm.cmd.Wait(); err != nil {
+			// Process exited with error
+		}
+		vm.state = vmm.VMStateStopped
+	}()
 
 	// Wait for API socket to be ready
 	if err := vm.waitForAPI(ctx, 30*time.Second); err != nil {
@@ -208,20 +230,23 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 
 // ForceStop forcefully stops the VM.
 func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
-	if vm.cmd != nil && vm.cmd.Process != nil {
-		// Try graceful termination first
-		if err := vm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			// Process might already be dead
-			vm.state = vmm.VMStateStopped
-			return nil
-		}
-
-		// Give it a moment to terminate gracefully
-		time.Sleep(2 * time.Second)
-
-		// Force kill if still running
-		_ = vm.cmd.Process.Kill()
+	if vm.cmd == nil || vm.cmd.Process == nil {
+		vm.state = vmm.VMStateStopped
+		return nil
 	}
+
+	// Try graceful termination first
+	if err := vm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		// Process might already be dead
+		vm.state = vmm.VMStateStopped
+		return nil
+	}
+
+	// Give it a moment to terminate gracefully
+	time.Sleep(2 * time.Second)
+
+	// Force kill if still running
+	_ = vm.cmd.Process.Kill()
 
 	vm.state = vmm.VMStateStopped
 	return nil
@@ -375,9 +400,8 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		args = append(args, "--disk", fmt.Sprintf("path=%s%s", vm.config.RootFS.Path, ro))
 	}
 
-	if vm.config.LogLevel != "" {
-		args = append(args, "--log-level", vm.config.LogLevel)
-	}
+	// Add debug logging
+	args = append(args, "--log-level", "debug")
 
 	// Add additional disks (will be vdb, vdc, etc.)
 	for _, disk := range vm.config.Disks {
@@ -406,11 +430,17 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
+	fmt.Printf("Waiting for API socket at %s...\n", vm.apiSocket)
+
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(vm.apiSocket); err == nil {
+			fmt.Printf("API socket found, trying to ping...\n")
 			// Try to ping the API
 			if err := vm.pingAPI(ctx); err == nil {
+				fmt.Printf("API is ready\n")
 				return nil
+			} else {
+				fmt.Printf("API ping failed: %v\n", err)
 			}
 		}
 
@@ -422,7 +452,7 @@ func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Durati
 		}
 	}
 
-	return fmt.Errorf("timeout waiting for API")
+	return fmt.Errorf("timeout waiting for API at %s (PID: %d)", vm.apiSocket, vm.pid)
 }
 
 // pingAPI checks if the API is responsive.
