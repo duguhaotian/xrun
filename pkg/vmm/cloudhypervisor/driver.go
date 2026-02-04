@@ -400,12 +400,28 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 	serialLogFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "console.log")
 	chLogFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "cloud-hypervisor.log")
 
+	// Build cmdline: if rootfs is set, add root parameter; otherwise use rdinit=/bin/sh
+	cmdline := vm.config.Boot.Cmdline
+	if vm.config.RootFS != "" {
+		if cmdline != "" {
+			cmdline += " root=/dev/vda1"
+		} else {
+			cmdline = "root=/dev/vda1"
+		}
+	} else {
+		if cmdline != "" {
+			cmdline += " rdinit=/bin/sh"
+		} else {
+			cmdline = "rdinit=/bin/sh"
+		}
+	}
+
 	args := []string{
 		"--api-socket", vm.apiSocket,
 		"--cpus", fmt.Sprintf("boot=%d", vm.config.VCPUs),
 		"--memory", memArgs,
 		"--kernel", vm.config.Boot.KernelPath,
-		"--cmdline", fmt.Sprintf("\"%s\"", vm.config.Boot.Cmdline),
+		"--cmdline", fmt.Sprintf("\"%s\"", cmdline),
 		"--console", "off",
 		"--serial", fmt.Sprintf("file=%s", serialLogFile),
 		"--log-file", chLogFile,

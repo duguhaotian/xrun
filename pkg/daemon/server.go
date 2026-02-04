@@ -310,6 +310,8 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 	// 5. Create VM
 	vm, err := driver.Create(ctx, vmConfig)
 	if err != nil {
+		vmDir := fmt.Sprintf("%s/vms/%s", s.config.DataDir, req.Id)
+		os.RemoveAll(vmDir)
 		s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey)
 		s.netMgr.Cleanup(ctx, req.Id, vmNet.NetNS)
 		s.imageCache.Release(req.Image)
@@ -318,9 +320,12 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 
 	// 6. Start VM
 	if err := vm.Start(ctx); err != nil {
+		vm.ForceStop(ctx)
 		s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey)
 		s.netMgr.Cleanup(ctx, req.Id, vmNet.NetNS)
 		s.imageCache.Release(req.Image)
+		vmDir := fmt.Sprintf("%s/vms/%s", s.config.DataDir, req.Id)
+		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
 
@@ -353,6 +358,8 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 		s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey)
 		s.netMgr.Cleanup(ctx, req.Id, vmNet.NetNS)
 		s.imageCache.Release(req.Image)
+		vmDir := fmt.Sprintf("%s/vms/%s", s.config.DataDir, req.Id)
+		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
