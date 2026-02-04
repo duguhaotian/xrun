@@ -558,7 +558,7 @@ func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Durati
 		if _, err := os.Stat(vm.apiSocket); err == nil {
 			// Try ping with short timeout
 			pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			if err := vm.pingAPI(pingCtx); err == nil {
+			if err = vm.pingAPI(pingCtx); err == nil {
 				cancel()
 				log.Debug("[VM.waitForAPI] VM %s API responded successfully on attempt %d", vm.id, attempt)
 				return nil
