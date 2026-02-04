@@ -556,7 +556,7 @@ func (vm *cloudHypervisorVM) pingAPI(ctx context.Context) error {
 	}
 	defer client.CloseIdleConnections()
 
-	url := fmt.Sprintf("http://localhost/api/%s/ping", apiVersion)
+	url := fmt.Sprintf("http://localhost/api/%s/vmm.ping", apiVersion)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create ping request: %w", err)
