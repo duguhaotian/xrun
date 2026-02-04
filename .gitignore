@@ -18,3 +18,7 @@ Cargo.lock
 # Added by cargo
 
 /target
+
+# Initrd build artifacts
+scripts/build/
+scripts/output/
