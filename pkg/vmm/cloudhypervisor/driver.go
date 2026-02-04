@@ -638,7 +638,11 @@ func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path strin
 
 	url := fmt.Sprintf("http://localhost/api/%s%s", apiVersion, path)
 
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	// Create context with timeout
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(callCtx, method, url, bodyReader)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -647,7 +651,7 @@ func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path strin
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	log.Debug("[VM.sendAPICall] VM %s sending request: %s %s", vm.id, method, url)
+	log.Debug("[VM.sendAPICall] VM %s sending request: %s %s (timeout: %v)", vm.id, method, url, timeout)
 
 	resp, err := vm.httpClient.Do(req)
 	if err != nil {
