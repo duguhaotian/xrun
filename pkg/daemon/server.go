@@ -14,6 +14,7 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/namespaces"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/microvm/sandbox/api/proto"
@@ -43,6 +44,9 @@ type Server struct {
 	// Runtime state
 	sandboxes map[string]*SandboxRuntime
 	mu        sync.RWMutex
+
+	// Shutdown state
+	shutdownCh chan struct{}
 }
 
 // SandboxRuntime holds runtime state for a sandbox.
@@ -69,6 +73,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		store:      store,
 		vmmFactory: factory,
 		sandboxes:  make(map[string]*SandboxRuntime),
+		shutdownCh: make(chan struct{}),
 	}, nil
 }
 
@@ -127,41 +132,116 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on %s: %w", s.config.SocketPath, err)
 	}
 
-	// Create gRPC server
-	s.grpcServer = grpc.NewServer()
+	// Create gRPC server with keepalive settings
+	s.grpcServer = grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 5 * time.Minute,
+		}),
+	)
 	pb.RegisterSandboxServiceServer(s.grpcServer, s)
 	reflection.Register(s.grpcServer)
 
 	log.Info("xrund server starting on %s", s.config.SocketPath)
 
-	// Handle signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// Handle signals in a separate goroutine
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	go func() {
-		<-sigCh
-		log.Info("Shutting down server...")
+		sig := <-sigCh
+		log.Info("Received signal %v, initiating shutdown...", sig)
+		signal.Stop(sigCh)
+		close(sigCh)
 		s.Shutdown()
 	}()
 
-	// Start serving
-	if err := s.grpcServer.Serve(lis); err != nil {
-		return fmt.Errorf("failed to serve: %w", err)
-	}
+	// Start serving in a goroutine so we can monitor shutdown
+	go func() {
+		if err := s.grpcServer.Serve(lis); err != nil {
+			log.Error("gRPC server error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-s.shutdownCh
+	log.Info("Server shutdown complete")
 
 	return nil
 }
 
-// Shutdown stops the server.
+// Shutdown stops the server gracefully.
 func (s *Server) Shutdown() {
+	select {
+	case <-s.shutdownCh:
+		return
+	default:
+		close(s.shutdownCh)
+	}
+
+	log.Info("Shutting down server...")
+
+	// Stop accepting new requests
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()
+		log.Info("gRPC server stopped")
 	}
+
+	// Stop all running sandboxes
+	s.stopAllSandboxes()
+
+	log.Info("Server shutdown finished")
+}
+
+// stopAllSandboxes stops all running sandboxes during shutdown.
+func (s *Server) stopAllSandboxes() {
+	s.mu.Lock()
+	runtimes := make([]*SandboxRuntime, 0, len(s.sandboxes))
+	for _, runtime := range s.sandboxes {
+		runtimes = append(runtimes, runtime)
+	}
+	s.mu.Unlock()
+
+	if len(runtimes) == 0 {
+		return
+	}
+
+	log.Info("Stopping %d running sandboxes...", len(runtimes))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for i, runtime := range runtimes {
+		log.Info("Stopping sandbox %s (%d/%d)", runtime.Meta.ID, i+1, len(runtimes))
+		if err := runtime.VM.Stop(ctx); err != nil {
+			log.Warn("Failed to stop sandbox %s: %v, forcing...", runtime.Meta.ID, err)
+			runtime.VM.ForceStop(ctx)
+		}
+		s.imageCache.Release(runtime.ImageRef)
+	}
+
+	s.mu.Lock()
+	for _, runtime := range runtimes {
+		delete(s.sandboxes, runtime.Meta.ID)
+	}
+	s.mu.Unlock()
+
+	log.Info("All sandboxes stopped")
 }
 
 // Run implements the Run RPC.
 func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, error) {
 	log.Info("Run request: id=%s, image=%s", req.Id, req.Image)
+
+	// Check for shutdown
+	select {
+	case <-s.shutdownCh:
+		return nil, fmt.Errorf("server is shutting down")
+	default:
+	}
+
+	// Add timeout to prevent indefinite blocking
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 
 	// Check if sandbox already exists
 	if _, err := s.store.Load(req.Id); err == nil {
@@ -172,6 +252,15 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 	driver, ok := s.vmmFactory.Get(s.config.VMM.DefaultDriver)
 	if !ok {
 		return nil, fmt.Errorf("VMM driver %s not found", s.config.VMM.DefaultDriver)
+	}
+
+	// Check for shutdown before proceeding
+	select {
+	case <-s.shutdownCh:
+		return nil, fmt.Errorf("server is shutting down")
+	case <-ctx.Done():
+		return nil, fmt.Errorf("operation timed out: %w", ctx.Err())
+	default:
 	}
 
 	// 1. Get or mount image (View snapshot, shared)
@@ -290,6 +379,13 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 // Stop implements the Stop RPC.
 func (s *Server) Stop(ctx context.Context, req *pb.StopRequest) (*pb.StopResponse, error) {
 	log.Info("Stop request: id=%s, force=%v", req.Id, req.Force)
+
+	// Check for shutdown
+	select {
+	case <-s.shutdownCh:
+		return nil, fmt.Errorf("server is shutting down")
+	default:
+	}
 
 	// First check if sandbox exists and is running
 	log.Debug("[Stop] Loading sandbox %s from store", req.Id)
