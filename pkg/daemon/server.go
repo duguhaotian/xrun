@@ -501,6 +501,12 @@ func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteR
 		}
 	}
 
+	// Release image reference
+	imageRef := meta.GetImageRef()
+	if imageRef != "" {
+		s.imageCache.Release(imageRef)
+	}
+
 	// Delete metadata
 	if err := s.store.Delete(req.Id); err != nil {
 		return nil, fmt.Errorf("failed to delete metadata: %w", err)

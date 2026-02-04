@@ -113,7 +113,7 @@ func newRunCmd(socketPath *string) *cobra.Command {
 	cmd.Flags().StringVarP(&rootfs, "rootfs", "r", "", "Rootfs disk path")
 	cmd.Flags().Uint32VarP(&vcpus, "vcpus", "c", 1, "Number of vCPUs")
 	cmd.Flags().Uint32VarP(&memory, "memory", "m", 512, "Memory in MB")
-	cmd.Flags().StringVar(&cmdline, "cmdline", "console=hvc0 root=/dev/vda1 rw", "Kernel command line")
+	cmd.Flags().StringVar(&cmdline, "cmdline", "", "Kernel command line (auto-configured if empty)")
 	cmd.Flags().StringArrayVarP(&labels, "label", "l", nil, "Labels (key=value)")
 	cmd.MarkFlagRequired("image")
 
