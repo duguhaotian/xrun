@@ -405,6 +405,7 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		"--memory", memArgs,
 		"--kernel", vm.config.Boot.KernelPath,
 		"--cmdline", fmt.Sprintf("\"%s\"", vm.config.Boot.Cmdline),
+		"--console", "off",
 		"--serial", fmt.Sprintf("file=%s", serialLogFile),
 	}
 
