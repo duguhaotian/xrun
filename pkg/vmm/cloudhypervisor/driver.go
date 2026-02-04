@@ -94,15 +94,16 @@ func (d *Driver) getAPISocketPath(vmID string) string {
 
 // cloudHypervisorVM implements the vmm.VM interface.
 type cloudHypervisorVM struct {
-	id        string
-	driver    *Driver
-	config    vmm.VMConfig
-	apiSocket string
-	cmd       *exec.Cmd
-	pid       int
-	state     vmm.VMState
-	mu        sync.RWMutex
-	waitDone  chan error
+	id         string
+	driver     *Driver
+	config     vmm.VMConfig
+	apiSocket  string
+	cmd        *exec.Cmd
+	pid        int
+	state      vmm.VMState
+	mu         sync.RWMutex
+	waitDone   chan error
+	httpClient *http.Client
 }
 
 // ID returns the VM ID.
@@ -147,6 +148,17 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 
 	vm.pid = vm.cmd.Process.Pid
 	vm.state = vmm.VMStateRunning
+
+	// Create reusable HTTP client for API calls
+	vm.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("unix", vm.apiSocket)
+			},
+		},
+		Timeout: 30 * time.Second,
+	}
+
 	log.Info("[VM.Start] VM %s started with PID %d, waiting for API socket", vm.id, vm.pid)
 
 	// Start goroutine to wait for process
@@ -262,6 +274,11 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 	vm.mu.Lock()
 	vm.state = vmm.VMStateStopped
 	vm.mu.Unlock()
+
+	// Close HTTP client
+	if vm.httpClient != nil {
+		vm.httpClient.CloseIdleConnections()
+	}
 
 	log.Info("[VM.ForceStop] VM %s force stopped successfully", vm.id)
 	return nil
@@ -524,16 +541,8 @@ func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path strin
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return net.Dial("unix", vm.apiSocket)
-			},
-		},
-		Timeout: timeout,
-	}
-
-	resp, err := client.Do(req)
+	// Use reusable HTTP client
+	resp, err := vm.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send API request: %w", err)
 	}
