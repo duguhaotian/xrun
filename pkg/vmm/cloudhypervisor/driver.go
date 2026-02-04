@@ -155,6 +155,9 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return net.Dial("unix", vm.apiSocket)
 			},
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     30 * time.Second,
 		},
 		Timeout: 30 * time.Second,
 	}
@@ -239,14 +242,10 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 	log.Info("[VM.ForceStop] Force stopping VM %s (PID: %d)", vm.id, pid)
 
 	if cmd != nil && cmd.Process != nil {
+		// First try SIGTERM
 		log.Debug("[VM.ForceStop] Sending SIGTERM to VM %s process", vm.id)
 		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			log.Warn("[VM.ForceStop] Failed to send SIGTERM to VM %s: %v", vm.id, err)
-			// Try SIGKILL directly
-			log.Debug("[VM.ForceStop] Trying SIGKILL for VM %s", vm.id)
-			if err := cmd.Process.Kill(); err != nil {
-				log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
-			}
+			log.Warn("[VM.ForceStop] Failed to send SIGTERM to VM %s: %v, trying SIGKILL", vm.id, err)
 		}
 
 		// Wait for process to exit with timeout
@@ -257,14 +256,44 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 		if waitDone != nil {
 			select {
 			case <-waitDone:
-				log.Debug("[VM.ForceStop] VM %s process exited", vm.id)
-			case <-time.After(3 * time.Second):
-				log.Warn("[VM.ForceStop] VM %s did not exit after 3s, sending SIGKILL", vm.id)
-				if err := cmd.Process.Kill(); err != nil {
-					log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+				log.Debug("[VM.ForceStop] VM %s process exited after SIGTERM", vm.id)
+				vm.mu.Lock()
+				vm.state = vmm.VMStateStopped
+				vm.mu.Unlock()
+				// Close HTTP client
+				if vm.httpClient != nil {
+					vm.httpClient.CloseIdleConnections()
 				}
-				// Wait for kill to complete
-				<-waitDone
+				return nil
+			case <-time.After(2 * time.Second):
+				log.Warn("[VM.ForceStop] VM %s did not exit after SIGTERM, sending SIGKILL", vm.id)
+			}
+		}
+
+		// Force kill with SIGKILL
+		log.Debug("[VM.ForceStop] Sending SIGKILL to VM %s process", vm.id)
+		if err := cmd.Process.Kill(); err != nil {
+			// Check if process is already gone
+			if err.Error() != "os: process already finished" {
+				log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+			}
+		}
+
+		// Wait for kill to complete
+		if waitDone != nil {
+			select {
+			case <-waitDone:
+				log.Debug("[VM.ForceStop] VM %s process killed successfully", vm.id)
+			case <-time.After(5 * time.Second):
+				log.Warn("[VM.ForceStop] VM %s process did not exit after SIGKILL", vm.id)
+			}
+		}
+
+		// Try to kill using PID as fallback (in case process was reparented)
+		if pid > 0 {
+			process, err := os.FindProcess(pid)
+			if err == nil {
+				process.Kill()
 			}
 		}
 	} else {
@@ -280,7 +309,7 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 		vm.httpClient.CloseIdleConnections()
 	}
 
-	log.Info("[VM.ForceStop] VM %s force stopped successfully", vm.id)
+	log.Info("[VM.ForceStop] VM %s force stopped", vm.id)
 	return nil
 }
 
@@ -541,10 +570,11 @@ func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path strin
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	// Use reusable HTTP client
+	log.Debug("[VM.sendAPICall] VM %s sending request: %s %s", vm.id, method, url)
+
 	resp, err := vm.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send API request: %w", err)
+		return fmt.Errorf("failed to send API request %s %s: %w", method, url, err)
 	}
 	defer resp.Body.Close()
 

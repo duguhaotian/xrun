@@ -331,12 +331,51 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 	// 6. Start VM
 	log.Debug("[Run] Step 6: Starting VM for sandbox %s", req.Id)
 	if err := vm.Start(ctx); err != nil {
-		vm.ForceStop(ctx)
-		s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey)
-		s.netMgr.Cleanup(ctx, req.Id, vmNet.NetNS)
+		log.Error("[Run] Failed to start VM %s: %v, performing cleanup", req.Id, err)
+
+		// Force stop VM first
+		log.Debug("[Run] Force stopping VM %s", req.Id)
+		if stopErr := vm.ForceStop(ctx); stopErr != nil {
+			log.Warn("[Run] Failed to force stop VM %s: %v", req.Id, stopErr)
+		}
+
+		// Give process time to exit
+		time.Sleep(500 * time.Millisecond)
+
+		// Cleanup memory file
+		if memFile.SnapshotKey != "" {
+			log.Debug("[Run] Deleting memory file %s", memFile.SnapshotKey)
+			if delErr := s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey); delErr != nil {
+				log.Warn("[Run] Failed to delete memory file %s: %v", memFile.SnapshotKey, delErr)
+			}
+		}
+
+		// Cleanup network
+		if vmNet.NetNS != nil {
+			log.Debug("[Run] Cleaning up network namespace %s", vmNet.NetNS.Path)
+			if netErr := s.netMgr.Cleanup(ctx, req.Id, vmNet.NetNS); netErr != nil {
+				log.Warn("[Run] Failed to cleanup network: %v", netErr)
+			}
+		}
+
+		// Release image
+		log.Debug("[Run] Releasing image reference %s", req.Image)
 		s.imageCache.Release(req.Image)
+
+		// Cleanup VM data directory
 		vmDir := fmt.Sprintf("%s/vms/%s", s.config.DataDir, req.Id)
-		os.RemoveAll(vmDir)
+		log.Debug("[Run] Removing VM directory %s", vmDir)
+		if rmErr := os.RemoveAll(vmDir); rmErr != nil {
+			log.Warn("[Run] Failed to remove VM directory %s: %v", vmDir, rmErr)
+		}
+
+		// Cleanup snapshots directory if exists
+		snapshotsDir := fmt.Sprintf("%s/snapshots/%s", s.config.DataDir, req.Id)
+		log.Debug("[Run] Removing snapshots directory %s", snapshotsDir)
+		if rmErr := os.RemoveAll(snapshotsDir); rmErr != nil {
+			log.Warn("[Run] Failed to remove snapshots directory %s: %v", snapshotsDir, rmErr)
+		}
+
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
 	log.Debug("[Run] Step 6 complete: VM started")
