@@ -114,15 +114,15 @@ func (vm *cloudHypervisorVM) ID() string {
 // Start starts the VM.
 func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
 	if vm.state == vmm.VMStateRunning {
+		vm.mu.Unlock()
 		return fmt.Errorf("VM is already running")
 	}
 
 	// Create VM log directory
 	vmDir := filepath.Join(vm.driver.dataDir, "vms", vm.id)
 	if err := os.MkdirAll(vmDir, 0755); err != nil {
+		vm.mu.Unlock()
 		return fmt.Errorf("failed to create VM directory: %w", err)
 	}
 
@@ -143,6 +143,7 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 
 	if err := vm.cmd.Start(); err != nil {
 		vm.state = vmm.VMStateFailed
+		vm.mu.Unlock()
 		return fmt.Errorf("failed to start VM: %w", err)
 	}
 
@@ -165,6 +166,9 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		vm.waitDone <- waitErr
 		close(vm.waitDone)
 	}()
+
+	// Unlock before waitForAPI to allow ForceStop to work
+	vm.mu.Unlock()
 
 	// Wait for API socket with shorter timeout and logging
 	if err := vm.waitForAPI(ctx, 30*time.Second); err != nil {
@@ -246,6 +250,9 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 
 	log.Info("[VM.ForceStop] Force stopping VM %s (PID: %d)", vm.id, pid)
 
+	processKilled := false
+
+	// Try to kill using cmd.Process first
 	if cmd != nil && cmd.Process != nil {
 		// First try SIGTERM
 		log.Debug("[VM.ForceStop] Sending SIGTERM to VM %s process", vm.id)
@@ -262,52 +269,82 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 			select {
 			case <-waitDone:
 				log.Debug("[VM.ForceStop] VM %s process exited after SIGTERM", vm.id)
-				vm.mu.Lock()
-				vm.state = vmm.VMStateStopped
-				vm.mu.Unlock()
-				// Close HTTP client
-				if vm.httpClient != nil {
-					vm.httpClient.CloseIdleConnections()
-				}
-				return nil
+				processKilled = true
 			case <-time.After(2 * time.Second):
 				log.Warn("[VM.ForceStop] VM %s did not exit after SIGTERM, sending SIGKILL", vm.id)
 			}
 		} else {
-			// waitDone is nil, process might have already exited
-			log.Debug("[VM.ForceStop] VM %s waitDone is nil, process might have already exited", vm.id)
-			// Still try to kill to be safe
-			cmd.Process.Kill()
+			// waitDone is nil, wait a bit for process to exit
+			log.Debug("[VM.ForceStop] VM %s waitDone is nil, waiting for process to exit", vm.id)
+			time.Sleep(2 * time.Second)
 		}
 
-		// Force kill with SIGKILL
-		log.Debug("[VM.ForceStop] Sending SIGKILL to VM %s process", vm.id)
-		if err := cmd.Process.Kill(); err != nil {
-			// Check if process is already gone
-			if err.Error() != "os: process already finished" {
-				log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+		if !processKilled {
+			// Force kill with SIGKILL
+			log.Debug("[VM.ForceStop] Sending SIGKILL to VM %s process", vm.id)
+			if err := cmd.Process.Kill(); err != nil {
+				// Check if process is already gone
+				if err.Error() != "os: process already finished" {
+					log.Warn("[VM.ForceStop] Failed to send SIGKILL to VM %s: %v", vm.id, err)
+				} else {
+					processKilled = true
+				}
+			} else {
+				processKilled = true
 			}
-		}
 
-		// Wait for kill to complete
-		if waitDone != nil {
-			select {
-			case <-waitDone:
-				log.Debug("[VM.ForceStop] VM %s process killed successfully", vm.id)
-			case <-time.After(5 * time.Second):
-				log.Warn("[VM.ForceStop] VM %s process did not exit after SIGKILL", vm.id)
+			// Wait for kill to complete
+			if waitDone != nil {
+				select {
+				case <-waitDone:
+					log.Debug("[VM.ForceStop] VM %s process killed successfully", vm.id)
+				case <-time.After(5 * time.Second):
+					log.Warn("[VM.ForceStop] VM %s process did not exit after SIGKILL", vm.id)
+				}
+			} else {
+				time.Sleep(1 * time.Second)
 			}
 		}
+	}
 
-		// Try to kill using PID as fallback (in case process was reparented)
-		if pid > 0 {
-			process, err := os.FindProcess(pid)
-			if err == nil {
-				process.Kill()
+	// Always try to kill using PID as primary method or fallback
+	if pid > 0 {
+		log.Debug("[VM.ForceStop] Trying to kill VM %s by PID %d", vm.id, pid)
+		process, err := os.FindProcess(pid)
+		if err == nil {
+			// Send SIGKILL
+			if killErr := process.Kill(); killErr != nil {
+				if killErr.Error() == "os: process already finished" {
+					log.Debug("[VM.ForceStop] VM %s process %d already finished", vm.id, pid)
+					processKilled = true
+				} else {
+					log.Warn("[VM.ForceStop] Failed to kill VM %s process %d: %v", vm.id, pid, killErr)
+				}
+			} else {
+				log.Debug("[VM.ForceStop] VM %s process %d killed by PID", vm.id, pid)
+				processKilled = true
+				// Wait a bit to ensure process exits
+				time.Sleep(500 * time.Millisecond)
 			}
+		} else {
+			log.Debug("[VM.ForceStop] VM %s process %d not found: %v", vm.id, pid, err)
 		}
-	} else {
-		log.Debug("[VM.ForceStop] VM %s has no process to stop", vm.id)
+	}
+
+	// If process still not killed, try pkill as last resort
+	if !processKilled && pid > 0 {
+		log.Warn("[VM.ForceStop] VM %s process %d still running, trying pkill", vm.id, pid)
+		pkillCmd := exec.Command("pkill", "-9", "-f", fmt.Sprintf("cloud-hypervisor.*%s", vm.id))
+		if err := pkillCmd.Run(); err != nil {
+			log.Debug("[VM.ForceStop] pkill failed (may be normal): %v", err)
+		} else {
+			log.Info("[VM.ForceStop] VM %s process killed with pkill", vm.id)
+			processKilled = true
+		}
+	}
+
+	if !processKilled {
+		log.Warn("[VM.ForceStop] VM %s may still have running processes", vm.id)
 	}
 
 	vm.mu.Lock()
