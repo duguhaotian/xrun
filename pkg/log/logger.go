@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// Global mutex for SetLevel
+var loggerMu sync.Mutex
+
 // Logger provides unified logging for xrun.
 type Logger struct {
 	mu     sync.Mutex
@@ -33,8 +36,8 @@ var (
 	once          sync.Once
 )
 
-// Init initializes the default logger.
-func Init(dataDir string) error {
+// Init initializes the default logger with the specified log level.
+func Init(dataDir string, logLevel string) error {
 	var err error
 	once.Do(func() {
 		logFile := filepath.Join(dataDir, "xrun.log")
@@ -51,12 +54,40 @@ func Init(dataDir string) error {
 			return
 		}
 
+		// Parse log level
+		level := parseLogLevel(logLevel)
+
 		defaultLogger = &Logger{
 			writer: f,
-			level:  INFO,
+			level:  level,
 		}
 	})
 	return err
+}
+
+// parseLogLevel converts string log level to LogLevel.
+func parseLogLevel(level string) LogLevel {
+	switch strings.ToLower(level) {
+	case "debug":
+		return DEBUG
+	case "info":
+		return INFO
+	case "warn", "warning":
+		return WARN
+	case "error":
+		return ERROR
+	default:
+		return INFO
+	}
+}
+
+// SetLevel sets the log level dynamically.
+func SetLevel(level string) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
+	if defaultLogger != nil {
+		defaultLogger.level = parseLogLevel(level)
+	}
 }
 
 // GetLogger returns the default logger.

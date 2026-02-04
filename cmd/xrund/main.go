@@ -55,7 +55,7 @@ func run() error {
 	}
 
 	// Initialize logging
-	if err := log.Init(cfg.DataDir); err != nil {
+	if err := log.Init(cfg.DataDir, cfg.LogLevel); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to initialize logging: %v\n", err)
 	}
 

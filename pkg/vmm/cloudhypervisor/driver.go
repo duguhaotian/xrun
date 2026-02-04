@@ -149,20 +149,7 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 	vm.pid = vm.cmd.Process.Pid
 	vm.state = vmm.VMStateRunning
 
-	// Create reusable HTTP client for API calls
-	vm.httpClient = &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return net.Dial("unix", vm.apiSocket)
-			},
-			MaxIdleConns:        10,
-			MaxIdleConnsPerHost: 5,
-			IdleConnTimeout:     30 * time.Second,
-		},
-		Timeout: 30 * time.Second,
-	}
-
-	log.Info("[VM.Start] VM %s started with PID %d, waiting for API socket", vm.id, vm.pid)
+	log.Info("[VM.Start] VM %s started with PID %d, apiSocket=%s", vm.id, vm.pid, vm.apiSocket)
 
 	// Start goroutine to wait for process
 	vm.waitDone = make(chan error, 1)
@@ -185,9 +172,27 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		vm.ForceStop(ctx)
 		return fmt.Errorf("VM API not ready: %w", err)
 	}
+
+	// Create HTTP client after API socket is ready
+	vm.createHTTPClient()
 	log.Info("[VM.Start] VM %s API ready, VM started successfully", vm.id)
 
 	return nil
+}
+
+// createHTTPClient creates HTTP client after socket is ready
+func (vm *cloudHypervisorVM) createHTTPClient() {
+	vm.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("unix", vm.apiSocket)
+			},
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     30 * time.Second,
+		},
+		Timeout: 30 * time.Second,
+	}
 }
 
 // Stop stops the VM gracefully.
@@ -268,6 +273,11 @@ func (vm *cloudHypervisorVM) ForceStop(ctx context.Context) error {
 			case <-time.After(2 * time.Second):
 				log.Warn("[VM.ForceStop] VM %s did not exit after SIGTERM, sending SIGKILL", vm.id)
 			}
+		} else {
+			// waitDone is nil, process might have already exited
+			log.Debug("[VM.ForceStop] VM %s waitDone is nil, process might have already exited", vm.id)
+			// Still try to kill to be safe
+			cmd.Process.Kill()
 		}
 
 		// Force kill with SIGKILL
@@ -535,7 +545,37 @@ func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Durati
 
 // pingAPI pings the API to check if it's ready.
 func (vm *cloudHypervisorVM) pingAPI(ctx context.Context) error {
-	return vm.sendAPICall(ctx, http.MethodGet, "/ping", nil, 2*time.Second)
+	// Create a temporary HTTP client for ping
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("unix", vm.apiSocket)
+			},
+		},
+		Timeout: 2 * time.Second,
+	}
+	defer client.CloseIdleConnections()
+
+	url := fmt.Sprintf("http://localhost/api/%s/ping", apiVersion)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create ping request: %w", err)
+	}
+
+	log.Debug("[VM.pingAPI] VM %s pinging: %s", vm.id, url)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("ping request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ping failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	log.Debug("[VM.pingAPI] VM %s ping successful", vm.id)
+	return nil
 }
 
 // getVMInfo retrieves VM information from the API.
