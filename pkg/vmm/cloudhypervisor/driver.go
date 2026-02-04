@@ -396,8 +396,9 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		memArgs += ",shared=on"
 	}
 
-	// Build serial log file path for VM console output
+	// Build log file paths
 	serialLogFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "console.log")
+	chLogFile := filepath.Join(vm.driver.dataDir, "vms", vm.id, "cloud-hypervisor.log")
 
 	args := []string{
 		"--api-socket", vm.apiSocket,
@@ -407,6 +408,8 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 		"--cmdline", fmt.Sprintf("\"%s\"", vm.config.Boot.Cmdline),
 		"--console", "off",
 		"--serial", fmt.Sprintf("file=%s", serialLogFile),
+		"--log-file", chLogFile,
+		"-vv",
 	}
 
 	// Add initrd if specified
