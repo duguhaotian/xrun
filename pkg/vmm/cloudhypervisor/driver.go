@@ -147,6 +147,7 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 
 	vm.pid = vm.cmd.Process.Pid
 	vm.state = vmm.VMStateRunning
+	log.Info("[VM.Start] VM %s started with PID %d, waiting for API socket", vm.id, vm.pid)
 
 	// Start goroutine to wait for process
 	vm.waitDone = make(chan error, 1)
@@ -163,11 +164,13 @@ func (vm *cloudHypervisorVM) Start(ctx context.Context) error {
 		close(vm.waitDone)
 	}()
 
-	// Wait for API socket
+	// Wait for API socket with shorter timeout and logging
 	if err := vm.waitForAPI(ctx, 30*time.Second); err != nil {
+		log.Error("[VM.Start] VM %s API not ready: %v, forcing stop", vm.id, err)
 		vm.ForceStop(ctx)
 		return fmt.Errorf("VM API not ready: %w", err)
 	}
+	log.Info("[VM.Start] VM %s API ready, VM started successfully", vm.id)
 
 	return nil
 }
@@ -190,7 +193,7 @@ func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if err := vm.sendAPICall(shutdownCtx, http.MethodPut, "/vm.shutdown", nil); err != nil {
+	if err := vm.sendAPICall(shutdownCtx, http.MethodPut, "/vm.shutdown", nil, 5*time.Second); err != nil {
 		log.Warn("[VM.Stop] Failed to send shutdown API call for VM %s: %v, will try force stop", vm.id, err)
 		return vm.ForceStop(ctx)
 	}
@@ -274,7 +277,7 @@ func (vm *cloudHypervisorVM) Pause(ctx context.Context) error {
 		return fmt.Errorf("VM is not running")
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.pause", nil); err != nil {
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.pause", nil, 30*time.Second); err != nil {
 		return fmt.Errorf("failed to pause VM: %w", err)
 	}
 
@@ -295,7 +298,7 @@ func (vm *cloudHypervisorVM) Resume(ctx context.Context) error {
 		return fmt.Errorf("VM is not paused")
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.resume", nil); err != nil {
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.resume", nil, 30*time.Second); err != nil {
 		return fmt.Errorf("failed to resume VM: %w", err)
 	}
 
@@ -316,7 +319,7 @@ func (vm *cloudHypervisorVM) Snapshot(ctx context.Context, path string) error {
 		"destination_url": fmt.Sprintf("file://%s", path),
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/create", body); err != nil {
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/create", body, 60*time.Second); err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
@@ -329,7 +332,7 @@ func (vm *cloudHypervisorVM) Restore(ctx context.Context, path string) error {
 		"source_url": fmt.Sprintf("file://%s", path),
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/restore", body); err != nil {
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/restore", body, 60*time.Second); err != nil {
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
 
@@ -453,22 +456,40 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 // waitForAPI waits for the API socket to become available.
 func (vm *cloudHypervisorVM) waitForAPI(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	attempt := 0
 
 	for time.Now().Before(deadline) {
+		attempt++
+
+		// Check if socket exists
 		if _, err := os.Stat(vm.apiSocket); err == nil {
-			if err := vm.pingAPI(ctx); err == nil {
+			// Try ping with short timeout
+			pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if err := vm.pingAPI(pingCtx); err == nil {
+				cancel()
+				log.Debug("[VM.waitForAPI] VM %s API responded successfully on attempt %d", vm.id, attempt)
 				return nil
 			}
+			cancel()
+			log.Debug("[VM.waitForAPI] VM %s API ping failed: %v, retrying...", vm.id, err)
+		} else {
+			log.Debug("[VM.waitForAPI] VM %s API socket not found yet (attempt %d)", vm.id, attempt)
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled while waiting for API: %w", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+			continue
+		}
 	}
 
-	return fmt.Errorf("timeout waiting for API")
+	return fmt.Errorf("timeout waiting for API after %d attempts (timeout: %v)", attempt, timeout)
 }
 
 // pingAPI pings the API to check if it's ready.
 func (vm *cloudHypervisorVM) pingAPI(ctx context.Context) error {
-	return vm.sendAPICall(ctx, http.MethodGet, "/ping", nil)
+	return vm.sendAPICall(ctx, http.MethodGet, "/ping", nil, 2*time.Second)
 }
 
 // getVMInfo retrieves VM information from the API.
@@ -482,7 +503,7 @@ func (vm *cloudHypervisorVM) getVMInfo(ctx context.Context) (*vmm.VMInfo, error)
 }
 
 // sendAPICall sends an HTTP request to the VM API via Unix socket.
-func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path string, body interface{}) error {
+func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path string, body interface{}, timeout time.Duration) error {
 	var bodyReader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -509,7 +530,7 @@ func (vm *cloudHypervisorVM) sendAPICall(ctx context.Context, method, path strin
 				return net.Dial("unix", vm.apiSocket)
 			},
 		},
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 	}
 
 	resp, err := client.Do(req)

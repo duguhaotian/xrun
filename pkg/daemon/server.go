@@ -264,27 +264,34 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 	}
 
 	// 1. Get or mount image (View snapshot, shared)
+	log.Debug("[Run] Step 1: Getting image %s for sandbox %s", req.Image, req.Id)
 	imgMount, err := s.imageCache.GetOrMount(ctx, req.Image)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount image: %w", err)
 	}
+	log.Debug("[Run] Step 1 complete: image mounted at %s", imgMount.MountPath)
 
 	// 2. Setup network
+	log.Debug("[Run] Step 2: Setting up network for sandbox %s", req.Id)
 	vmNet, err := s.netMgr.Setup(ctx, req.Id)
 	if err != nil {
 		s.imageCache.Release(req.Image)
 		return nil, fmt.Errorf("failed to setup network: %w", err)
 	}
+	log.Debug("[Run] Step 2 complete: network setup, tap=%s", vmNet.TapDevice)
 
 	// 3. Create memory file (RW snapshot)
+	log.Debug("[Run] Step 3: Creating memory file (%dMB) for sandbox %s", req.MemoryMb, req.Id)
 	memFile, err := s.storageMgr.CreateMemoryFile(ctx, req.Id, req.MemoryMb)
 	if err != nil {
 		s.netMgr.Cleanup(ctx, req.Id, vmNet.NetNS)
 		s.imageCache.Release(req.Image)
 		return nil, fmt.Errorf("failed to create memory file: %w", err)
 	}
+	log.Debug("[Run] Step 3 complete: memory file created at %s", memFile.Path)
 
 	// 4. Create VM config
+	log.Debug("[Run] Step 4: Creating VM config for sandbox %s", req.Id)
 	vmConfig := vmm.VMConfig{
 		ID:    req.Id,
 		VCPUs: req.Vcpus,
@@ -306,8 +313,10 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 	if vmNet.NetNS != nil {
 		vmConfig.NetNS = vmNet.NetNS.Path
 	}
+	log.Debug("[Run] Step 4 complete: VM config created, cmdline=%s, rootfs=%s", vmConfig.Boot.Cmdline, vmConfig.RootFS)
 
 	// 5. Create VM
+	log.Debug("[Run] Step 5: Creating VM for sandbox %s", req.Id)
 	vm, err := driver.Create(ctx, vmConfig)
 	if err != nil {
 		vmDir := fmt.Sprintf("%s/vms/%s", s.config.DataDir, req.Id)
@@ -317,8 +326,10 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 		s.imageCache.Release(req.Image)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
+	log.Debug("[Run] Step 5 complete: VM created")
 
 	// 6. Start VM
+	log.Debug("[Run] Step 6: Starting VM for sandbox %s", req.Id)
 	if err := vm.Start(ctx); err != nil {
 		vm.ForceStop(ctx)
 		s.storageMgr.DeleteMemoryFile(ctx, memFile.SnapshotKey)
@@ -328,6 +339,7 @@ func (s *Server) Run(ctx context.Context, req *pb.RunRequest) (*pb.RunResponse, 
 		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
+	log.Debug("[Run] Step 6 complete: VM started")
 
 	// Get VM info
 	vmInfo, err := vm.Info(ctx)
