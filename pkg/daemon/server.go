@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -468,11 +472,32 @@ func (s *Server) Stop(ctx context.Context, req *pb.StopRequest) (*pb.StopRespons
 	if !ok {
 		// Sandbox is marked as running in store but not in runtime cache
 		// This can happen if the daemon was restarted
-		// Just update the state to stopped
-		log.Warn("[Stop] Sandbox %s is marked as running but not in runtime cache, updating state to stopped", req.Id)
+		log.Warn("[Stop] Sandbox %s is marked as running but not in runtime cache (daemon restarted)", req.Id)
+
+		// Try to kill the process using PID from metadata
+		if meta.PID > 0 {
+			log.Info("[Stop] Trying to kill process %d for sandbox %s", meta.PID, req.Id)
+			if err := s.killProcessByPID(ctx, meta.PID); err != nil {
+				log.Warn("[Stop] Failed to kill process %d: %v", meta.PID, err)
+			} else {
+				log.Info("[Stop] Successfully killed process %d for sandbox %s", meta.PID, req.Id)
+			}
+		} else {
+			// Try pkill as fallback
+			log.Info("[Stop] Trying pkill for sandbox %s", req.Id)
+			if err := s.killProcessByName(ctx, req.Id); err != nil {
+				log.Warn("[Stop] pkill failed: %v", err)
+			}
+		}
+
+		// Update state to stopped
 		if err := s.store.UpdateState(req.Id, vmm.VMStateStopped); err != nil {
 			return nil, fmt.Errorf("failed to update sandbox state: %w", err)
 		}
+
+		// Cleanup resources
+		s.cleanupSandboxResources(ctx, req.Id, nil, meta)
+
 		return &pb.StopResponse{
 			Id:    req.Id,
 			State: string(vmm.VMStateStopped),
@@ -800,4 +825,143 @@ func metaToProto(meta *sandbox.Meta) *pb.Sandbox {
 		CreatedAt: meta.CreatedAt,
 		Labels:    meta.Labels,
 	}
+}
+
+// killProcessByPID kills a process by its PID.
+func (s *Server) killProcessByPID(ctx context.Context, pid int) error {
+	log.Debug("[Server] Killing process %d", pid)
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("failed to find process %d: %w", pid, err)
+	}
+
+	// Try SIGTERM first
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		log.Warn("[Server] Failed to send SIGTERM to process %d: %v, trying SIGKILL", pid, err)
+	}
+
+	// Wait a bit for process to exit
+	time.Sleep(2 * time.Second)
+
+	// Try SIGKILL
+	if err := process.Kill(); err != nil {
+		if err.Error() != "os: process already finished" {
+			return fmt.Errorf("failed to kill process %d: %w", pid, err)
+		}
+	}
+
+	log.Info("[Server] Successfully killed process %d", pid)
+	return nil
+}
+
+// killProcessByName kills cloud-hypervisor process by VM ID using pkill.
+func (s *Server) killProcessByName(ctx context.Context, vmID string) error {
+	log.Debug("[Server] Trying pkill for VM %s", vmID)
+
+	// Try pkill first
+	pkillCmd := exec.Command("pkill", "-9", "-f", fmt.Sprintf("cloud-hypervisor.*%s", vmID))
+	if err := pkillCmd.Run(); err != nil {
+		log.Debug("[Server] pkill failed: %v", err)
+	} else {
+		log.Info("[Server] Killed cloud-hypervisor process for VM %s", vmID)
+		return nil
+	}
+
+	// Try to find and kill any cloud-hypervisor process with this VM ID in args
+	pids, err := s.findProcessesByVMID(vmID)
+	if err != nil {
+		return err
+	}
+
+	for _, pid := range pids {
+		if pid > 0 && pid != os.Getpid() {
+			log.Debug("[Server] Killing process %d for VM %s", pid, vmID)
+			if err := s.killProcessByPID(ctx, pid); err != nil {
+				log.Warn("[Server] Failed to kill process %d: %v", pid, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// findProcessesByVMID finds PIDs of processes matching the VM ID.
+func (s *Server) findProcessesByVMID(vmID string) ([]int, error) {
+	var pids []int
+
+	// Read /proc to find processes
+	procDir, err := os.Open("/proc")
+	if err != nil {
+		return nil, err
+	}
+	defer procDir.Close()
+
+	entries, err := procDir.Readdirnames(0)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		// Skip non-numeric entries
+		if _, err := strconv.Atoi(entry); err != nil {
+			continue
+		}
+
+		// Read cmdline
+		cmdlinePath := filepath.Join("/proc", entry, "cmdline")
+		data, err := os.ReadFile(cmdlinePath)
+		if err != nil {
+			continue
+		}
+
+		// Check if cmdline contains cloud-hypervisor and VM ID
+		cmdline := string(data)
+		if strings.Contains(cmdline, "cloud-hypervisor") && strings.Contains(cmdline, vmID) {
+			pid, _ := strconv.Atoi(entry)
+			pids = append(pids, pid)
+		}
+	}
+
+	return pids, nil
+}
+
+// cleanupSandboxResources cleans up resources for a sandbox.
+func (s *Server) cleanupSandboxResources(ctx context.Context, id string, netNS *network.NetNS, meta *sandbox.Meta) {
+	log.Debug("[Server] Cleaning up resources for sandbox %s", id)
+
+	// Cleanup network
+	if netNS != nil {
+		if err := s.netMgr.Cleanup(ctx, id, netNS); err != nil {
+			log.Warn("[Server] Failed to cleanup network for %s: %v", id, err)
+		}
+	}
+
+	// Release image
+	if meta != nil {
+		imageRef := meta.GetImageRef()
+		if imageRef != "" {
+			s.imageCache.Release(imageRef)
+		}
+
+		// Delete memory file
+		if meta.MemorySnapshot != "" {
+			if err := s.storageMgr.DeleteMemoryFile(ctx, meta.MemorySnapshot); err != nil {
+				log.Warn("[Server] Failed to delete memory file %s: %v", meta.MemorySnapshot, err)
+			}
+		}
+	}
+
+	// Cleanup VM data directory
+	vmDir := filepath.Join(s.config.DataDir, "vms", id)
+	if err := os.RemoveAll(vmDir); err != nil {
+		log.Warn("[Server] Failed to remove VM directory %s: %v", vmDir, err)
+	}
+
+	// Cleanup snapshots directory
+	snapshotsDir := filepath.Join(s.config.DataDir, "snapshots", id)
+	if err := os.RemoveAll(snapshotsDir); err != nil {
+		log.Warn("[Server] Failed to remove snapshots directory %s: %v", snapshotsDir, err)
+	}
+
+	log.Info("[Server] Resources cleaned up for sandbox %s", id)
 }
