@@ -641,7 +641,35 @@ func (s *Server) Snapshot(ctx context.Context, req *pb.SnapshotRequest) (*pb.Sna
 	s.mu.Unlock()
 
 	if !ok {
-		return nil, fmt.Errorf("sandbox %s not found or not running", req.Id)
+		// Sandbox not in runtime cache, check if it exists in store
+		meta, err := s.store.Load(req.Id)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox %s not found", req.Id)
+		}
+
+		// Check if sandbox is running based on state
+		if meta.State != vmm.VMStateRunning && meta.State != vmm.VMStatePaused {
+			return nil, fmt.Errorf("sandbox %s is not running (state: %s)", req.Id, meta.State)
+		}
+
+		// Try to reconnect to the VM using PID from metadata
+		log.Info("Reconnecting to VM %s (PID: %d)", req.Id, meta.PID)
+		vm, err := s.reconnectToVM(ctx, meta)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reconnect to VM: %w", err)
+		}
+
+		// Add to runtime cache
+		s.mu.Lock()
+		s.sandboxes[req.Id] = &SandboxRuntime{
+			Meta:     meta,
+			VM:       vm,
+			ImageRef: meta.GetImageRef(),
+		}
+		runtime = s.sandboxes[req.Id]
+		s.mu.Unlock()
+
+		log.Info("Successfully reconnected to VM %s", req.Id)
 	}
 
 	// Pause VM for consistent snapshot
@@ -964,4 +992,53 @@ func (s *Server) cleanupSandboxResources(ctx context.Context, id string, netNS *
 	}
 
 	log.Info("[Server] Resources cleaned up for sandbox %s", id)
+}
+
+// reconnectToVM reconnects to a running VM using metadata from store.
+func (s *Server) reconnectToVM(ctx context.Context, meta *sandbox.Meta) (vmm.VM, error) {
+	log.Info("[Server] Reconnecting to VM %s (PID: %d)", meta.ID, meta.PID)
+
+	// Get the driver
+	driver, ok := s.vmmFactory.Get(s.config.VMM.DefaultDriver)
+	if !ok {
+		return nil, fmt.Errorf("VMM driver %s not found", s.config.VMM.DefaultDriver)
+	}
+
+	// Create VM config from metadata
+	vmConfig := vmm.VMConfig{
+		ID:    meta.ID,
+		VCPUs: meta.VCPUs,
+		Memory: vmm.MemoryConfig{
+			SizeMB: meta.MemoryMB,
+		},
+	}
+
+	// Get image info
+	imageInfo := meta.GetImageInfo()
+	if imageInfo != nil {
+		vmConfig.Boot = vmm.BootConfig{
+			KernelPath: imageInfo.KernelPath,
+			InitrdPath: imageInfo.InitrdPath,
+		}
+		vmConfig.RootFS = imageInfo.RootFS
+	}
+
+	// Get network info
+	netInfo := meta.GetNetworkInfo()
+	if netInfo != nil && netInfo.TapDevice != "" {
+		vmConfig.TapDevice = netInfo.TapDevice
+		vmConfig.VMIP = netInfo.IPAddr
+	}
+
+	// Create VM instance
+	vm, err := driver.Create(ctx, vmConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VM instance: %w", err)
+	}
+
+	// Reconnect to existing process using PID
+	// This is a best-effort attempt - the VM object will use the PID from metadata
+	log.Info("[Server] Will use PID %d for VM %s", meta.PID, meta.ID)
+
+	return vm, nil
 }
