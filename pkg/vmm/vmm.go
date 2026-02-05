@@ -110,6 +110,9 @@ type VM interface {
 
 	// Wait blocks until the VM stops.
 	Wait(ctx context.Context) error
+
+	// Reconnect reconnects to an existing running VM process.
+	Reconnect(pid int)
 }
 
 // Factory creates appropriate VMM drivers based on configuration.

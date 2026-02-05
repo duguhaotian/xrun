@@ -1036,9 +1036,9 @@ func (s *Server) reconnectToVM(ctx context.Context, meta *sandbox.Meta) (vmm.VM,
 		return nil, fmt.Errorf("failed to create VM instance: %w", err)
 	}
 
-	// Reconnect to existing process using PID
-	// This is a best-effort attempt - the VM object will use the PID from metadata
-	log.Info("[Server] Will use PID %d for VM %s", meta.PID, meta.ID)
+	// Reconnect to existing process using PID from metadata
+	vm.Reconnect(meta.PID)
+	log.Info("[Server] Reconnected to VM %s with PID %d", meta.ID, meta.PID)
 
 	return vm, nil
 }

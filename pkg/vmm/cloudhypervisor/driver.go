@@ -199,6 +199,21 @@ func (vm *cloudHypervisorVM) createHTTPClient() {
 	}
 }
 
+// Reconnect reconnects to an existing running VM process.
+func (vm *cloudHypervisorVM) Reconnect(pid int) {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	vm.pid = pid
+	vm.state = vmm.VMStateRunning
+	vm.waitDone = make(chan error, 1)
+
+	// Create HTTP client
+	vm.createHTTPClient()
+
+	log.Info("[VM.Reconnect] Reconnected to VM %s (PID: %d)", vm.id, vm.pid)
+}
+
 // Stop stops the VM gracefully.
 func (vm *cloudHypervisorVM) Stop(ctx context.Context) error {
 	vm.mu.RLock()
