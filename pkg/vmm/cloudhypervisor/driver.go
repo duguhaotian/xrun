@@ -412,7 +412,7 @@ func (vm *cloudHypervisorVM) Snapshot(ctx context.Context, path string) error {
 		"destination_url": fmt.Sprintf("file://%s", path),
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/create", body, 60*time.Second); err != nil {
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.snapshot", body, 60*time.Second); err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
@@ -425,7 +425,7 @@ func (vm *cloudHypervisorVM) Restore(ctx context.Context, path string) error {
 		"source_url": fmt.Sprintf("file://%s", path),
 	}
 
-	if err := vm.sendAPICall(ctx, http.MethodPut, "/snapshot/restore", body, 60*time.Second); err != nil {
+	if err := vm.sendAPICall(ctx, http.MethodPut, "/vm.restore", body, 60*time.Second); err != nil {
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
 
