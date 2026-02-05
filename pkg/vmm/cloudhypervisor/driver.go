@@ -498,13 +498,13 @@ func (vm *cloudHypervisorVM) Wait(ctx context.Context) error {
 // buildArgs builds command line arguments for cloud-hypervisor.
 func (vm *cloudHypervisorVM) buildArgs() []string {
 	// Build memory configuration
-	memArgs := fmt.Sprintf("size=%dM", vm.config.Memory.SizeMB)
+	memZoneArgs := fmt.Sprintf("id=mem0,size=%dM", vm.config.Memory.SizeMB)
 
 	if vm.config.Memory.Backend == vmm.MemoryBackendFile && vm.config.Memory.BackendPath != "" {
-		memArgs += fmt.Sprintf(",file=%s", vm.config.Memory.BackendPath)
+		memZoneArgs += fmt.Sprintf(",file=%s", vm.config.Memory.BackendPath)
 	}
 	if vm.config.Memory.Shared {
-		memArgs += ",shared=on"
+		memZoneArgs += ",shared=on"
 	}
 
 	// Build log file paths
@@ -530,7 +530,8 @@ func (vm *cloudHypervisorVM) buildArgs() []string {
 	args := []string{
 		"--api-socket", vm.apiSocket,
 		"--cpus", fmt.Sprintf("boot=%d", vm.config.VCPUs),
-		"--memory", memArgs,
+		"--memory", "size=0",
+		"--memory-zone", memZoneArgs,
 		"--kernel", vm.config.Boot.KernelPath,
 		"--cmdline", fmt.Sprintf("\"%s\"", cmdline),
 		"--console", "off",
